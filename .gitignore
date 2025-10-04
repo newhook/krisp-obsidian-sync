@@ -1,1 +1,5 @@
+.idea
 .env
+.krisp_sync_state.json
+meetings
+krisp-sync
