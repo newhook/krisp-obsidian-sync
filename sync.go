@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,58 +13,96 @@ import (
 	"text/template"
 )
 
+//go:embed summary-template.md
+var obsidianSummaryTemplate string
+
+//go:embed daily-note-template.md
+var dailyNoteTemplate string
+
 // Stage 3: Sync cached meetings and summaries to Obsidian
-func runSync(obsidianVaultPath string, limit int) error {
+func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, resync bool, testMode bool, cache *Cache) error {
 	fmt.Println("\n=== Stage 3: Syncing to Obsidian ===")
 
-	// Get all cached meeting files
-	files, err := filepath.Glob(filepath.Join(meetingsCacheDir, "*.json"))
-	if err != nil {
-		return fmt.Errorf("error reading cache directory: %w", err)
+	if testMode {
+		fmt.Println("🧪 Test mode: will overwrite files without updating state")
 	}
 
-	if len(files) == 0 {
-		fmt.Println("⚠ No cached meetings found. Run download step first.")
+	// If resync flag is set, clear the Obsidian sync state
+	if resync && !testMode {
+		fmt.Println("🔄 Resync mode: clearing Obsidian sync state")
+		syncState.ObsidianSyncedMeetings = make(map[string]bool)
+	}
+
+	// Get list of meetings that need to be synced to Obsidian and load them
+	type MeetingWithSummary struct {
+		Meeting     *Meeting
+		SummaryData *SummaryData
+	}
+
+	var toSync []*MeetingWithSummary
+	for id := range syncState.SyncedMeetings {
+		// In test mode, include all meetings; otherwise only unsynced ones
+		if testMode || !syncState.ObsidianSyncedMeetings[id] {
+			// Load the meeting once
+			meeting, err := cache.LoadMeeting(id)
+			if err != nil {
+				fmt.Printf("⚠ Error loading meeting %s: %v\n", id, err)
+				continue
+			}
+
+			// Load summary data (if exists)
+			var summaryData *SummaryData
+			if cache.SummaryExists(meeting.ID) {
+				summaryData, err = cache.LoadSummary(meeting.ID)
+				if err != nil {
+					fmt.Printf("⚠ Error loading summary for %s: %v\n", meeting.ID, err)
+				}
+			}
+
+			toSync = append(toSync, &MeetingWithSummary{
+				Meeting:     meeting,
+				SummaryData: summaryData,
+			})
+		}
+	}
+
+	if len(toSync) == 0 {
+		fmt.Println("✅ All downloaded meetings already synced to Obsidian!")
 		return nil
 	}
 
-	// Load all meetings and group by date
-	type MeetingWithSummary struct {
-		Meeting *Meeting
-		Summary string
+	// Sort by creation time (oldest first)
+	sort.Slice(toSync, func(i, j int) bool {
+		return toSync[i].Meeting.CreatedAt.Before(toSync[j].Meeting.CreatedAt)
+	})
+
+	// In test mode, only take the first meeting
+	if testMode && len(toSync) > 0 {
+		toSync = toSync[:1]
+		limit = 1
+		fmt.Printf("🧪 Test mode: processing first meeting only\n")
 	}
 
+	fmt.Printf("Found %d meeting(s) to sync to Obsidian (oldest to newest)\n", len(toSync))
+
+	// Group meetings by date
 	meetingsByDate := make(map[string][]*MeetingWithSummary)
 
 	processedCount := 0
-	for _, file := range files {
+	for _, mws := range toSync {
+		// Check if context was cancelled
+		if ctx.Err() != nil {
+			fmt.Printf("\n⚠ Sync cancelled\n")
+			return ctx.Err()
+		}
+
 		if limit > 0 && processedCount >= limit {
 			break
 		}
 
-		meetingID := strings.TrimSuffix(filepath.Base(file), ".json")
-
-		// Load meeting from cache
-		meeting, err := loadMeetingFromCache(meetingID)
-		if err != nil {
-			fmt.Printf("⚠ Error loading meeting %s: %v\n", meetingID, err)
-			continue
-		}
-
-		// Load summary from cache (if exists)
-		summary := ""
-		if summaryExistsInCache(meetingID) {
-			summary, err = loadSummaryFromCache(meetingID)
-			if err != nil {
-				fmt.Printf("⚠ Error loading summary for %s: %v\n", meetingID, err)
-			}
-		}
-
-		dateKey := meeting.CreatedAt.Format("2006-01-02")
-		meetingsByDate[dateKey] = append(meetingsByDate[dateKey], &MeetingWithSummary{
-			Meeting: meeting,
-			Summary: summary,
-		})
+		// Group by date
+		dateKey := mws.Meeting.CreatedAt.Format("2006-01-02")
+		meetingsByDate[dateKey] = append(meetingsByDate[dateKey], mws)
 
 		processedCount++
 	}
@@ -104,9 +144,14 @@ func runSync(obsidianVaultPath string, limit int) error {
 			continue
 		}
 
-		// Create individual meeting files and collect links
-		var meetingLinks []string
+		// Create individual meeting files
 		for _, mws := range dayMeetings {
+			// Check if context was cancelled
+			if ctx.Err() != nil {
+				fmt.Printf("\n⚠ Sync cancelled\n")
+				return ctx.Err()
+			}
+
 			m := mws.Meeting
 
 			// Get participants from speakers
@@ -123,14 +168,29 @@ func runSync(obsidianVaultPath string, limit int) error {
 			}
 
 			// Prepare template data for summary file
-			templateData := map[string]string{
+			description := ""
+			var tags []string
+			summary := ""
+			if mws.SummaryData != nil {
+				description = mws.SummaryData.Description
+				// Split comma-separated tags into array
+				if mws.SummaryData.Tags != "" {
+					for _, tag := range strings.Split(mws.SummaryData.Tags, ",") {
+						tags = append(tags, strings.TrimSpace(tag))
+					}
+				}
+				summary = mws.SummaryData.Summary
+			}
+
+			templateData := map[string]interface{}{
 				"Date":         m.CreatedAt.Format("2006-01-02"),
 				"Time":         m.CreatedAt.Format("15:04"),
 				"Title":        m.Title,
-				"Tags":         "[]",
+				"Description":  description,
+				"Tags":         tags,
 				"Participants": participantsStr,
 				"MeetingID":    m.ID,
-				"Summary":      mws.Summary,
+				"Summary":      summary,
 			}
 
 			// Render summary file
@@ -140,64 +200,104 @@ func runSync(obsidianVaultPath string, limit int) error {
 				continue
 			}
 
-			// Write summary file
+			// Write summary file (skip if exists unless in test mode)
 			summaryFileName := fmt.Sprintf("%s-summary.md", m.ID)
 			summaryFilePath := filepath.Join(meetingsPath, summaryFileName)
-			if err := os.WriteFile(summaryFilePath, summaryBuf.Bytes(), 0644); err != nil {
-				fmt.Printf("  ⚠ Error writing summary file: %v\n", err)
-				continue
+			if !testMode && fileExists(summaryFilePath) {
+				fmt.Printf("  ⏭  Summary exists, skipping: %s\n", summaryFileName)
+			} else {
+				if err := os.WriteFile(summaryFilePath, summaryBuf.Bytes(), 0644); err != nil {
+					fmt.Printf("  ⚠ Error writing summary file: %v\n", err)
+					continue
+				}
+				if testMode {
+					fmt.Printf("  ✓ Overwrote summary: %s\n", summaryFileName)
+				} else {
+					fmt.Printf("  ✓ Created summary: %s\n", summaryFileName)
+				}
 			}
 
-			// Generate transcript file
+			// Generate transcript file (skip if exists unless in test mode)
 			transcriptFileName := fmt.Sprintf("%s-transcript.md", m.ID)
 			transcriptFilePath := filepath.Join(meetingsPath, transcriptFileName)
-			transcriptContent := generateTranscriptContent(m)
-			if err := os.WriteFile(transcriptFilePath, []byte(transcriptContent), 0644); err != nil {
-				fmt.Printf("  ⚠ Error writing transcript file: %v\n", err)
-				continue
+			if !testMode && fileExists(transcriptFilePath) {
+				fmt.Printf("  ⏭  Transcript exists, skipping: %s\n", transcriptFileName)
+			} else {
+				transcriptContent := generateTranscriptContent(m)
+				if err := os.WriteFile(transcriptFilePath, []byte(transcriptContent), 0644); err != nil {
+					fmt.Printf("  ⚠ Error writing transcript file: %v\n", err)
+					continue
+				}
+				if testMode {
+					fmt.Printf("  ✓ Overwrote transcript: %s\n", transcriptFileName)
+				} else {
+					fmt.Printf("  ✓ Created transcript: %s\n", transcriptFileName)
+				}
 			}
 
-			// Add link to daily note (only link to summary)
-			meetingLinks = append(meetingLinks, fmt.Sprintf("- [[meetings/%s|%s - %s]]",
-				m.ID+"-summary",
-				m.CreatedAt.Format("3:04 PM"),
-				m.Title))
+			// Mark meeting as synced to Obsidian (skip in test mode)
+			if !testMode {
+				syncState.ObsidianSyncedMeetings[m.ID] = true
+
+				// Save state after each meeting sync
+				if err := syncState.Save(); err != nil {
+					fmt.Printf("  ⚠ Warning: Could not save sync state: %v\n", err)
+				}
+			}
+
+			successCount++
 		}
 
-		// Update daily note with meeting links
+		// Create or update daily note with Dataview query
 		filename := fmt.Sprintf("%s-%s.md", date, dayName)
 		filePath := filepath.Join(dailyNotesPath, filename)
 
-		// Check if daily note already exists
-		existingContent := ""
-		if data, err := os.ReadFile(filePath); err == nil {
-			existingContent = string(data)
-		}
-
-		// Generate content with meeting links
-		meetingsContent := strings.Join(meetingLinks, "\n") + "\n\n"
-
-		// Append or create the daily note
-		var finalContent string
-		if existingContent != "" {
-			// Append to existing note
-			finalContent = appendToExistingNote(existingContent, meetingsContent)
+		// In test mode, always overwrite; otherwise skip if exists
+		if !testMode && fileExists(filePath) {
+			fmt.Printf("  ✓ Daily note already exists: %s (using Dataview query)\n", filename)
 		} else {
-			// Create new daily note
-			finalContent = createNewDailyNote(date, meetingsContent)
+			// Create daily note with Dataview query
+			dailyNoteTmpl, err := template.New("dailynote").Parse(dailyNoteTemplate)
+			if err != nil {
+				fmt.Printf("  ⚠ Error parsing daily note template: %v\n", err)
+				continue
+			}
+
+			dailyNoteData := map[string]string{
+				"Date":      date,
+				"YearPath":  year,
+				"MonthPath": monthNum + "-" + monthName,
+			}
+
+			var dailyNoteBuf bytes.Buffer
+			if err := dailyNoteTmpl.Execute(&dailyNoteBuf, dailyNoteData); err != nil {
+				fmt.Printf("  ⚠ Error rendering daily note template: %v\n", err)
+				continue
+			}
+
+			if err := os.WriteFile(filePath, dailyNoteBuf.Bytes(), 0644); err != nil {
+				fmt.Printf("  ⚠ Error writing daily note: %v\n", err)
+				continue
+			}
+
+			if testMode {
+				fmt.Printf("  ✓ Overwrote daily note: %s (with Dataview query)\n", filename)
+			} else {
+				fmt.Printf("  ✓ Created daily note: %s (with Dataview query)\n", filename)
+			}
 		}
 
-		if err := os.WriteFile(filePath, []byte(finalContent), 0644); err != nil {
-			fmt.Printf("  ⚠ Error writing file: %v\n", err)
-			continue
-		}
-
-		fmt.Printf("  ✓ Updated: %s (%d meeting file(s))\n", filename, len(dayMeetings))
-		successCount += len(dayMeetings)
+		fmt.Printf("  ✓ Synced %d meeting file(s)\n", len(dayMeetings))
 	}
 
 	fmt.Printf("\n✅ Synced %d meeting(s) to %d daily note(s)\n", successCount, len(meetingsByDate))
 	return nil
+}
+
+// fileExists checks if a file exists
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
 
 func generateTranscriptContent(m *Meeting) string {
@@ -229,117 +329,6 @@ func generateTranscriptContent(m *Meeting) string {
 
 				sb.WriteString(fmt.Sprintf("**[%s] %s**: %s\n\n", timestamp, speakerName, segment.Speech.Text))
 			}
-		}
-	}
-
-	return sb.String()
-}
-
-func createNewDailyNote(date string, meetingsContent string) string {
-	var sb strings.Builder
-
-	// Basic daily note structure
-	sb.WriteString("# " + date + "\n\n")
-	sb.WriteString("## Meetings\n\n")
-	sb.WriteString(meetingsContent)
-
-	return sb.String()
-}
-
-func appendToExistingNote(existingContent, meetingsContent string) string {
-	// Check if there's already a Meetings section
-	if strings.Contains(existingContent, "## Meetings") {
-		// Find the Meetings section and append there
-		lines := strings.Split(existingContent, "\n")
-		var result strings.Builder
-		inMeetingsSection := false
-		meetingsAdded := false
-
-		for i, line := range lines {
-			result.WriteString(line + "\n")
-
-			if strings.HasPrefix(line, "## Meetings") {
-				inMeetingsSection = true
-			} else if inMeetingsSection && strings.HasPrefix(line, "## ") {
-				// Found next section, insert meetings before it
-				if !meetingsAdded {
-					result.WriteString(meetingsContent)
-					meetingsAdded = true
-				}
-				inMeetingsSection = false
-			}
-
-			// If we're at the end and still in meetings section
-			if inMeetingsSection && i == len(lines)-1 && !meetingsAdded {
-				result.WriteString(meetingsContent)
-				meetingsAdded = true
-			}
-		}
-
-		// If meetings section was at the end
-		if inMeetingsSection && !meetingsAdded {
-			result.WriteString(meetingsContent)
-		}
-
-		return result.String()
-	} else {
-		// No Meetings section exists, append it at the end
-		return existingContent + "\n## Meetings\n\n" + meetingsContent
-	}
-}
-
-// Legacy function - kept for reference but not currently used
-func generateMeetingContent(m *Meeting) string {
-	var sb strings.Builder
-
-	// Meeting header
-	timeStr := m.CreatedAt.Format("3:04 PM")
-	dateStr := m.CreatedAt.Format("Monday, January 2, 2006")
-	sb.WriteString(fmt.Sprintf("# %s - %s\n\n", timeStr, m.Title))
-	sb.WriteString(fmt.Sprintf("**Date**: %s\n", dateStr))
-
-	// Metadata
-	if m.Duration > 0 {
-		minutes := m.Duration / 60
-		seconds := m.Duration % 60
-		sb.WriteString(fmt.Sprintf("**Duration**: %d:%02d\n", minutes, seconds))
-	}
-	sb.WriteString(fmt.Sprintf("**Meeting ID**: `%s`\n\n", m.ID))
-
-	// Summary
-	if m.Summary != "" {
-		sb.WriteString("## Summary\n\n")
-		sb.WriteString(m.Summary + "\n\n")
-	}
-
-	// Notes
-	if m.Notes != "" {
-		sb.WriteString("## Notes\n\n")
-		sb.WriteString(m.Notes + "\n\n")
-	}
-
-	// Transcript in collapsible section
-	if m.Resources.Transcript.Status == "uploaded" && m.Resources.Transcript.Content != "" {
-		var segments []Segment
-		if err := json.Unmarshal([]byte(m.Resources.Transcript.Content), &segments); err == nil && len(segments) > 0 {
-			sb.WriteString("## Transcript\n\n")
-			sb.WriteString("<details>\n<summary>📝 Full Transcript</summary>\n\n")
-
-			for _, segment := range segments {
-				timestamp := formatTimestamp(segment.Speech.Start)
-
-				// Get speaker name from the speakers map
-				speakerName := fmt.Sprintf("Speaker %d", segment.SpeakerIndex)
-				if speakerInfo, ok := m.Speakers.Data[fmt.Sprintf("%d", segment.SpeakerIndex)]; ok {
-					if speakerInfo.Person.FirstName != "" || speakerInfo.Person.LastName != "" {
-						speakerName = strings.TrimSpace(speakerInfo.Person.FirstName + " " + speakerInfo.Person.LastName)
-					}
-				}
-
-				sb.WriteString(fmt.Sprintf("**[%s] %s**: %s\n\n", timestamp, speakerName, segment.Speech.Text))
-			}
-
-			sb.WriteString("</details>\n\n")
 		}
 	}
 

@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -75,12 +76,17 @@ type Speech struct {
 }
 
 // Krisp API functions
-func fetchAllMeetings() ([]MeetingSummary, error) {
+func fetchAllMeetings(ctx context.Context) ([]MeetingSummary, error) {
 	var allMeetings []MeetingSummary
 	page := 1
 	limit := 20
 
 	for {
+		// Check if context was cancelled
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
 		requestBody := MeetingsListRequest{
 			Sort:    "asc", // Get oldest first
 			SortKey: "created_at",
@@ -94,7 +100,7 @@ func fetchAllMeetings() ([]MeetingSummary, error) {
 			return nil, err
 		}
 
-		req, err := http.NewRequest("POST", apiBaseURL+"/meetings/list", bytes.NewBuffer(jsonData))
+		req, err := http.NewRequestWithContext(ctx, "POST", apiBaseURL+"/meetings/list", bytes.NewBuffer(jsonData))
 		if err != nil {
 			return nil, err
 		}
@@ -136,8 +142,8 @@ func fetchAllMeetings() ([]MeetingSummary, error) {
 	return allMeetings, nil
 }
 
-func fetchMeeting(meetingID string) (*Meeting, error) {
-	req, err := http.NewRequest("GET", apiBaseURL+"/meetings/"+meetingID, nil)
+func fetchMeeting(ctx context.Context, meetingID string) (*Meeting, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", apiBaseURL+"/meetings/"+meetingID, nil)
 	if err != nil {
 		return nil, err
 	}

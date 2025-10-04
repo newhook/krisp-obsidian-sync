@@ -3,9 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	_ "embed"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
+	"sort"
 	"strings"
 	"text/template"
 	"time"
@@ -13,27 +14,53 @@ import (
 	"google.golang.org/genai"
 )
 
+//go:embed summary-prompt.md
+var summaryPromptTemplate string
+
 // Stage 2: Summarize cached meetings with Gemini
-func runSummarize(limit int, syncState *SyncState, syncStatePath string, ctx context.Context) error {
+func runSummarize(ctx context.Context, limit int, syncState *SyncState, resummarize bool, cache *Cache) error {
 	fmt.Println("\n=== Stage 2: Summarizing meetings ===")
 
-	// Get all cached meeting files
-	files, err := filepath.Glob(filepath.Join(meetingsCacheDir, "*.json"))
-	if err != nil {
-		return fmt.Errorf("error reading cache directory: %w", err)
+	if resummarize {
+		fmt.Println("🔄 Resummarize mode: clearing summarization state")
+		syncState.SummarizedMeetings = make(map[string]bool)
 	}
 
-	if len(files) == 0 {
+	// Load tags dictionary if it exists
+	dict, err := loadTagsDictionary()
+	var existingTags []string
+	if err == nil && dict != nil {
+		existingTags = dict.CanonicalTags
+		fmt.Printf("📚 Loaded %d canonical tags from dictionary\n", len(existingTags))
+	} else {
+		fmt.Println("📝 No tags dictionary found - tags will be generated freely")
+	}
+
+	// Get meetings from sync state that need summarization
+	if len(syncState.SyncedMeetings) == 0 {
 		fmt.Println("⚠ No cached meetings found. Run download step first.")
 		return nil
 	}
 
-	// Filter to meetings that need summarization
-	var toSummarize []string
-	for _, file := range files {
-		meetingID := strings.TrimSuffix(filepath.Base(file), ".json")
-		if !summaryExistsInCache(meetingID) {
-			toSummarize = append(toSummarize, meetingID)
+	// Load meetings that need summarization and sort by creation time
+	type meetingToSummarize struct {
+		ID        string
+		CreatedAt time.Time
+	}
+
+	var toSummarize []meetingToSummarize
+	for meetingID := range syncState.SyncedMeetings {
+		if !syncState.SummarizedMeetings[meetingID] {
+			// Load meeting to get creation time for sorting
+			meeting, err := cache.LoadMeeting(meetingID)
+			if err != nil {
+				fmt.Printf("⚠ Error loading meeting %s for sorting: %v\n", meetingID, err)
+				continue
+			}
+			toSummarize = append(toSummarize, meetingToSummarize{
+				ID:        meetingID,
+				CreatedAt: meeting.CreatedAt,
+			})
 		}
 	}
 
@@ -42,7 +69,12 @@ func runSummarize(limit int, syncState *SyncState, syncStatePath string, ctx con
 		return nil
 	}
 
-	fmt.Printf("Found %d meeting(s) to summarize\n", len(toSummarize))
+	// Sort by creation time (oldest first)
+	sort.Slice(toSummarize, func(i, j int) bool {
+		return toSummarize[i].CreatedAt.Before(toSummarize[j].CreatedAt)
+	})
+
+	fmt.Printf("Found %d meeting(s) to summarize (oldest to newest)\n", len(toSummarize))
 
 	// Apply limit
 	if limit > 0 && len(toSummarize) > limit {
@@ -51,11 +83,17 @@ func runSummarize(limit int, syncState *SyncState, syncStatePath string, ctx con
 	}
 
 	// Summarize each meeting
-	for i, meetingID := range toSummarize {
-		fmt.Printf("[%d/%d] Summarizing meeting: %s\n", i+1, len(toSummarize), meetingID)
+	for i, m := range toSummarize {
+		// Check if context was cancelled
+		if ctx.Err() != nil {
+			fmt.Printf("\n⚠ Summarization cancelled\n")
+			return ctx.Err()
+		}
 
-		// Load from cache
-		meeting, err := loadMeetingFromCache(meetingID)
+		fmt.Printf("[%d/%d] Summarizing meeting: %s\n", i+1, len(toSummarize), m.ID)
+
+		// Load from cache (might already be cached from sorting)
+		meeting, err := cache.LoadMeeting(m.ID)
 		if err != nil {
 			fmt.Printf("  ⚠ Error loading from cache: %v\n", err)
 			continue
@@ -82,23 +120,26 @@ func runSummarize(limit int, syncState *SyncState, syncStatePath string, ctx con
 		}
 
 		// Generate summary with Gemini
-		summary, err := summarizeWithGemini(ctx, transcriptText)
+		summaryResponse, err := summarizeWithGemini(ctx, transcriptText, existingTags)
 		if err != nil {
 			fmt.Printf("  ⚠ Error generating summary: %v\n", err)
 			continue
 		}
 
+		// Parse the summary response to SummaryData
+		summaryData := parseSummaryResponse(summaryResponse)
+
 		// Save summary to cache
-		if err := saveSummaryToCache(meetingID, summary); err != nil {
+		if err := cache.SaveSummary(m.ID, summaryData); err != nil {
 			fmt.Printf("  ⚠ Error saving summary: %v\n", err)
 			continue
 		}
 
-		syncState.SummarizedMeetings[meetingID] = true
-		fmt.Printf("  ✓ Summary saved: meetings/%s-summary.md\n", meetingID)
+		syncState.SummarizedMeetings[m.ID] = true
+		fmt.Printf("  ✓ Summary saved: meetings/%s-summary.json\n", m.ID)
 
 		// Save state after each summary
-		if err := saveSyncState(syncStatePath, syncState); err != nil {
+		if err := syncState.Save(); err != nil {
 			fmt.Printf("  ⚠ Warning: Could not save sync state: %v\n", err)
 		}
 
@@ -110,7 +151,7 @@ func runSummarize(limit int, syncState *SyncState, syncStatePath string, ctx con
 	return nil
 }
 
-func summarizeWithGemini(ctx context.Context, transcript string) (string, error) {
+func summarizeWithGemini(ctx context.Context, transcript string, existingTags []string) (string, error) {
 	client, err := genai.NewClient(ctx, &genai.ClientConfig{
 		Project:  gcpProject,
 		Location: gcpLocation,
@@ -133,7 +174,56 @@ func summarizeWithGemini(ctx context.Context, transcript string) (string, error)
 	}
 	prompt := promptBuf.String()
 
-	resp, err := client.Models.GenerateContent(ctx, "gemini-2.5-flash-lite", []*genai.Content{
+	// Add existing tags guidance if available
+	if len(existingTags) > 0 {
+		prompt += fmt.Sprintf("\n\nPrefer using these existing tags when appropriate:\n%s\n\nYou may suggest new tags if none of these fit well.", strings.Join(existingTags, ", "))
+	}
+
+	// Define JSON schema for structured output
+	schema := &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"description": {
+				Type:        genai.TypeString,
+				Description: "One-line description of the meeting",
+			},
+			"tags": {
+				Type:        genai.TypeArray,
+				Description: "List of relevant tags/keywords",
+				Items: &genai.Schema{
+					Type: genai.TypeString,
+				},
+			},
+			"topics": {
+				Type:        genai.TypeArray,
+				Description: "List of topics discussed",
+				Items: &genai.Schema{
+					Type: genai.TypeString,
+				},
+			},
+			"topic_details": {
+				Type:        genai.TypeArray,
+				Description: "Detailed paragraphs for each topic",
+				Items: &genai.Schema{
+					Type: genai.TypeObject,
+					Properties: map[string]*genai.Schema{
+						"topic": {
+							Type:        genai.TypeString,
+							Description: "Topic name",
+						},
+						"summary": {
+							Type:        genai.TypeString,
+							Description: "One paragraph summary including key points, decisions, and action items",
+						},
+					},
+					Required: []string{"topic", "summary"},
+				},
+			},
+		},
+		Required: []string{"description", "tags", "topics", "topic_details"},
+	}
+
+	resp, err := client.Models.GenerateContent(ctx, "gemini-2.0-flash-lite", []*genai.Content{
 		{
 			Role: "user",
 			Parts: []*genai.Part{
@@ -141,8 +231,10 @@ func summarizeWithGemini(ctx context.Context, transcript string) (string, error)
 			},
 		},
 	}, &genai.GenerateContentConfig{
-		Temperature:     func() *float32 { v := float32(0.3); return &v }(),
-		MaxOutputTokens: 2048,
+		Temperature:      func() *float32 { v := float32(0.3); return &v }(),
+		MaxOutputTokens:  2048,
+		ResponseMIMEType: "application/json",
+		ResponseSchema:   schema,
 	})
 	if err != nil {
 		return "", fmt.Errorf("failed to generate summary: %w", err)
@@ -154,4 +246,50 @@ func summarizeWithGemini(ctx context.Context, transcript string) (string, error)
 
 	summary := fmt.Sprintf("%v", resp.Candidates[0].Content.Parts[0].Text)
 	return summary, nil
+}
+
+// parseSummaryResponse parses the JSON response from the LLM
+func parseSummaryResponse(response string) *SummaryData {
+	var data struct {
+		Description  string   `json:"description"`
+		Tags         []string `json:"tags"`
+		Topics       []string `json:"topics"`
+		TopicDetails []struct {
+			Topic   string `json:"topic"`
+			Summary string `json:"summary"`
+		} `json:"topic_details"`
+	}
+
+	if err := json.Unmarshal([]byte(response), &data); err != nil {
+		fmt.Printf("  ⚠ Error parsing JSON response: %v\n", err)
+		// Fallback to raw response
+		return &SummaryData{
+			Description: "",
+			Tags:        "",
+			Summary:     response,
+		}
+	}
+
+	// Build the formatted summary
+	var sb strings.Builder
+
+	// Topics Discussed section
+	sb.WriteString("## Topics Discussed\n")
+	for _, topic := range data.Topics {
+		sb.WriteString(fmt.Sprintf("- %s\n", topic))
+	}
+	sb.WriteString("\n")
+
+	// Detailed topic sections
+	for _, detail := range data.TopicDetails {
+		sb.WriteString(fmt.Sprintf("## %s\n", detail.Topic))
+		sb.WriteString(detail.Summary)
+		sb.WriteString("\n\n")
+	}
+
+	return &SummaryData{
+		Description: data.Description,
+		Tags:        strings.Join(data.Tags, ", "),
+		Summary:     sb.String(),
+	}
 }

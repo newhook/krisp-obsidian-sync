@@ -3,14 +3,16 @@ date: {{.Date}}
 time: {{.Time}}
 type: meeting
 title: {{.Title}}
-tags: {{.Tags}}
+description: {{.Description}}
+tags:{{range .Tags}}
+  - "{{.}}"{{end}}
 participants: {{.Participants}}
 ---
 
 # {{.Title}}
 
-**Transcript**: [[meetings/{{.MeetingID}}-transcript|View Transcript]]
+> {{.Description}}
 
-## Summary
+**Transcript**: [[meetings/{{.MeetingID}}-transcript|View Transcript]]
 
 {{.Summary}}

@@ -2,22 +2,17 @@ package main
 
 import (
 	"context"
-	_ "embed"
 	"flag"
 	"fmt"
 	"log"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/joho/godotenv"
 )
-
-//go:embed summary-prompt.md
-var summaryPromptTemplate string
-
-//go:embed summary-template.md
-var obsidianSummaryTemplate string
 
 const (
 	apiBaseURL       = "https://api.krisp.ai/v2"
@@ -34,7 +29,10 @@ var (
 func main() {
 	// Parse command-line flags
 	limitFlag := flag.Int("limit", 1, "Number of meetings to process (default: 1 for testing)")
-	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, or all (default: all)")
+	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, normalize, repair, or all (default: all)")
+	resyncFlag := flag.Bool("resync", false, "Force re-sync all meetings to Obsidian, ignoring sync state")
+	resummarizeFlag := flag.Bool("resummarize", false, "Force re-summarize all meetings, ignoring summarization state")
+	testFlag := flag.Bool("test", false, "Test mode: create a single test file without updating state (sync stage only)")
 	flag.Parse()
 
 	// Load environment variables from .env file
@@ -73,7 +71,12 @@ func main() {
 		fmt.Printf("🔄 Last sync: %s\n", syncState.LastSyncTime.Format("2006-01-02 15:04:05"))
 	}
 
-	ctx := context.Background()
+	// Create cache instance
+	cache := NewCache(meetingsCacheDir)
+
+	// Create context that cancels on Ctrl+C (SIGINT) or SIGTERM
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
 
 	// Determine which steps to run
 	step := *stepFlag
@@ -81,7 +84,7 @@ func main() {
 
 	// Stage 1: Download
 	if runAll || step == "download" {
-		if err := runDownload(*limitFlag, syncState, syncStatePath); err != nil {
+		if err := runDownload(ctx, *limitFlag, syncState, cache); err != nil {
 			fmt.Printf("❌ Error in download stage: %v\n", err)
 			return
 		}
@@ -89,7 +92,7 @@ func main() {
 
 	// Stage 2: Summarize
 	if runAll || step == "summarize" {
-		if err := runSummarize(*limitFlag, syncState, syncStatePath, ctx); err != nil {
+		if err := runSummarize(ctx, *limitFlag, syncState, *resummarizeFlag, cache); err != nil {
 			fmt.Printf("❌ Error in summarize stage: %v\n", err)
 			return
 		}
@@ -97,15 +100,31 @@ func main() {
 
 	// Stage 3: Sync
 	if runAll || step == "sync" {
-		if err := runSync(obsidianVaultPath, *limitFlag); err != nil {
+		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *resyncFlag, *testFlag, cache); err != nil {
 			fmt.Printf("❌ Error in sync stage: %v\n", err)
+			return
+		}
+	}
+
+	// Stage 4: Normalize tags
+	if runAll || step == "normalize" {
+		if err := runNormalize(ctx, cache); err != nil {
+			fmt.Printf("❌ Error in normalize stage: %v\n", err)
+			return
+		}
+	}
+
+	// Repair: Ensure all cached meetings are in sync state
+	if step == "repair" {
+		if err := runRepair(syncState, cache); err != nil {
+			fmt.Printf("❌ Error in repair stage: %v\n", err)
 			return
 		}
 	}
 
 	// Update sync state
 	syncState.LastSyncTime = time.Now()
-	if err := saveSyncState(syncStatePath, syncState); err != nil {
+	if err := syncState.Save(); err != nil {
 		fmt.Printf("⚠ Warning: Could not save sync state: %v\n", err)
 	}
 
