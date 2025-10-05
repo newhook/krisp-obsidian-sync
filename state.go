@@ -26,6 +26,22 @@ func loadSyncState(path string) *SyncState {
 		path:                   path,
 	}
 
+	// Check for orphaned temp file from crashed save
+	tempPath := path + ".new"
+	if _, err := os.Stat(tempPath); err == nil {
+		// Temp file exists, check if main file exists
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			// Main file missing but temp exists - recover from temp
+			fmt.Printf("⚠ Recovering state from temp file: %s\n", tempPath)
+			if err := os.Rename(tempPath, path); err != nil {
+				fmt.Printf("⚠ Failed to recover from temp file: %v\n", err)
+			}
+		} else {
+			// Both exist - temp is stale, remove it
+			os.Remove(tempPath)
+		}
+	}
+
 	data, err := os.ReadFile(path)
 	if err != nil {
 		// File doesn't exist, return empty state
@@ -59,11 +75,25 @@ func loadSyncState(path string) *SyncState {
 	return state
 }
 
-// Save saves the sync state to disk
+// Save saves the sync state to disk atomically
 func (s *SyncState) Save() error {
 	data, err := json.MarshalIndent(s, "", "  ")
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(s.path, data, 0644)
+
+	// Atomic write: write to temp file, then rename
+	tempPath := s.path + ".new"
+
+	// Write to temporary file
+	if err := os.WriteFile(tempPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	// Rename temp file to actual file (atomic on POSIX filesystems)
+	if err := os.Rename(tempPath, s.path); err != nil {
+		return fmt.Errorf("failed to rename temp file: %w", err)
+	}
+
+	return nil
 }

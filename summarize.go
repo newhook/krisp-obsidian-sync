@@ -18,8 +18,19 @@ import (
 var summaryPromptTemplate string
 
 // Stage 2: Summarize cached meetings with Gemini
-func runSummarize(ctx context.Context, limit int, syncState *SyncState, resummarize bool, cache *Cache) error {
+func runSummarize(ctx context.Context, limit int, syncState *SyncState, resummarize bool, meetingID string, cache *Cache) error {
 	fmt.Println("\n=== Stage 2: Summarizing meetings ===")
+
+	// Handle single meeting mode
+	if meetingID != "" {
+		fmt.Printf("🎯 Single meeting mode: %s\n", meetingID)
+		if resummarize {
+			fmt.Println("🔄 Forcing re-summarization of this meeting")
+			delete(syncState.SummarizedMeetings, meetingID)
+		}
+		// Process only this meeting
+		return summarizeSingleMeeting(ctx, meetingID, syncState, cache)
+	}
 
 	if resummarize {
 		fmt.Println("🔄 Resummarize mode: clearing summarization state")
@@ -82,72 +93,137 @@ func runSummarize(ctx context.Context, limit int, syncState *SyncState, resummar
 		toSummarize = toSummarize[:limit]
 	}
 
-	// Summarize each meeting
-	for i, m := range toSummarize {
+	// Load all meetings first (cache is not thread-safe)
+	type meetingWithTranscript struct {
+		ID         string
+		Transcript string
+	}
+	var meetingsToProcess []meetingWithTranscript
+
+	for _, m := range toSummarize {
+		meeting, err := cache.LoadMeeting(m.ID)
+		if err != nil {
+			fmt.Printf("⚠ Error loading meeting %s: %v\n", m.ID, err)
+			continue
+		}
+
+		// Parse transcript
+		var transcriptText string
+		if meeting.Resources.Transcript.Status != "uploaded" {
+			fmt.Printf("⚠ Transcript not uploaded for %s (status: %s)\n", m.ID, meeting.Resources.Transcript.Status)
+			continue
+		}
+		if meeting.Resources.Transcript.Content == "" {
+			fmt.Printf("⚠ Transcript content empty for %s\n", m.ID)
+			continue
+		}
+
+		var segments []Segment
+		if err := json.Unmarshal([]byte(meeting.Resources.Transcript.Content), &segments); err != nil {
+			fmt.Printf("⚠ Error parsing transcript JSON for %s: %v\n", m.ID, err)
+			continue
+		}
+
+		if len(segments) == 0 {
+			fmt.Printf("⚠ Transcript has no segments for %s\n", m.ID)
+			continue
+		}
+
+		var sb strings.Builder
+		for _, seg := range segments {
+			// Get speaker name from the speakers map
+			speakerName := fmt.Sprintf("Speaker %d", seg.SpeakerIndex)
+			if speakerInfo, ok := meeting.Speakers.Data[fmt.Sprintf("%d", seg.SpeakerIndex)]; ok {
+				speakerName = strings.TrimSpace(speakerInfo.Person.FirstName + " " + speakerInfo.Person.LastName)
+				if speakerName == "" {
+					speakerName = fmt.Sprintf("Speaker %d", seg.SpeakerIndex)
+				}
+			}
+			sb.WriteString(fmt.Sprintf("%s: %s\n", speakerName, seg.Speech.Text))
+		}
+		transcriptText = sb.String()
+
+		if transcriptText == "" {
+			fmt.Printf("⚠ Generated transcript text is empty for %s\n", m.ID)
+			continue
+		}
+
+		meetingsToProcess = append(meetingsToProcess, meetingWithTranscript{
+			ID:         m.ID,
+			Transcript: transcriptText,
+		})
+	}
+
+	if len(meetingsToProcess) == 0 {
+		fmt.Println("⚠ No meetings with transcripts to process")
+		return nil
+	}
+
+	// Process summaries in parallel with concurrency limit
+	const maxConcurrency = 10
+	semaphore := make(chan struct{}, maxConcurrency)
+
+	type result struct {
+		index int
+		id    string
+		data  *SummaryData
+		err   error
+	}
+	results := make(chan result, len(meetingsToProcess))
+
+	// Process each meeting in parallel
+	for i, m := range meetingsToProcess {
 		// Check if context was cancelled
 		if ctx.Err() != nil {
 			fmt.Printf("\n⚠ Summarization cancelled\n")
 			return ctx.Err()
 		}
 
-		fmt.Printf("[%d/%d] Summarizing meeting: %s\n", i+1, len(toSummarize), m.ID)
+		semaphore <- struct{}{} // Acquire semaphore
 
-		// Load from cache (might already be cached from sorting)
-		meeting, err := cache.LoadMeeting(m.ID)
-		if err != nil {
-			fmt.Printf("  ⚠ Error loading from cache: %v\n", err)
-			continue
-		}
+		go func(index int, meetingID string, transcript string) {
+			defer func() { <-semaphore }() // Release semaphore
 
-		// Parse transcript
-		var transcriptText string
-		if meeting.Resources.Transcript.Status == "uploaded" && meeting.Resources.Transcript.Content != "" {
-			var segments []Segment
-			if err := json.Unmarshal([]byte(meeting.Resources.Transcript.Content), &segments); err != nil {
-				fmt.Printf("  ⚠ Error parsing transcript: %v\n", err)
-			} else if len(segments) > 0 {
-				var sb strings.Builder
-				for _, seg := range segments {
-					sb.WriteString(fmt.Sprintf("Speaker %d: %s\n", seg.SpeakerIndex, seg.Speech.Text))
-				}
-				transcriptText = sb.String()
+			fmt.Printf("[%d/%d] Summarizing meeting: %s\n", index+1, len(meetingsToProcess), meetingID)
+
+			// Generate summary with Gemini
+			summaryResponse, err := summarizeWithGemini(ctx, transcript, existingTags)
+			if err != nil {
+				fmt.Printf("  ⚠ Error generating summary: %v\n", err)
+				results <- result{index: index, id: meetingID, err: err}
+				return
 			}
-		}
 
-		if transcriptText == "" {
-			fmt.Printf("  ⚠ No transcript available\n")
-			continue
-		}
+			// Parse the summary response to SummaryData
+			summaryData := parseSummaryResponse(summaryResponse)
 
-		// Generate summary with Gemini
-		summaryResponse, err := summarizeWithGemini(ctx, transcriptText, existingTags)
-		if err != nil {
-			fmt.Printf("  ⚠ Error generating summary: %v\n", err)
-			continue
-		}
-
-		// Parse the summary response to SummaryData
-		summaryData := parseSummaryResponse(summaryResponse)
-
-		// Save summary to cache
-		if err := cache.SaveSummary(m.ID, summaryData); err != nil {
-			fmt.Printf("  ⚠ Error saving summary: %v\n", err)
-			continue
-		}
-
-		syncState.SummarizedMeetings[m.ID] = true
-		fmt.Printf("  ✓ Summary saved: meetings/%s-summary.json\n", m.ID)
-
-		// Save state after each summary
-		if err := syncState.Save(); err != nil {
-			fmt.Printf("  ⚠ Warning: Could not save sync state: %v\n", err)
-		}
-
-		// Be nice to the API
-		time.Sleep(500 * time.Millisecond)
+			fmt.Printf("  ✓ Summary generated: %s\n", meetingID)
+			results <- result{index: index, id: meetingID, data: summaryData, err: nil}
+		}(i, m.ID, m.Transcript)
 	}
 
-	fmt.Printf("\n✅ Summarized %d meeting(s)\n", len(toSummarize))
+	// Wait for all goroutines to complete and save results
+	successCount := 0
+	for i := 0; i < len(meetingsToProcess); i++ {
+		res := <-results
+		if res.err == nil {
+			// Save summary to cache
+			if err := cache.SaveSummary(res.id, res.data); err != nil {
+				fmt.Printf("  ⚠ Error saving summary for %s: %v\n", res.id, err)
+				continue
+			}
+			fmt.Printf("  ✓ Summary saved: meetings/%s-summary.json\n", res.id)
+
+			syncState.SummarizedMeetings[res.id] = true
+			successCount++
+			// Save state after each successful summary
+			if err := syncState.Save(); err != nil {
+				fmt.Printf("  ⚠ Warning: Could not save sync state: %v\n", err)
+			}
+		}
+	}
+
+	fmt.Printf("\n✅ Summarized %d meeting(s)\n", successCount)
 	return nil
 }
 
@@ -232,7 +308,6 @@ func summarizeWithGemini(ctx context.Context, transcript string, existingTags []
 		},
 	}, &genai.GenerateContentConfig{
 		Temperature:      func() *float32 { v := float32(0.3); return &v }(),
-		MaxOutputTokens:  2048,
 		ResponseMIMEType: "application/json",
 		ResponseSchema:   schema,
 	})
@@ -292,4 +367,77 @@ func parseSummaryResponse(response string) *SummaryData {
 		Tags:        strings.Join(data.Tags, ", "),
 		Summary:     sb.String(),
 	}
+}
+
+// summarizeSingleMeeting summarizes a single meeting by ID
+func summarizeSingleMeeting(ctx context.Context, meetingID string, syncState *SyncState, cache *Cache) error {
+	// Load tags dictionary if it exists
+	dict, err := loadTagsDictionary()
+	var existingTags []string
+	if err == nil && dict != nil {
+		existingTags = dict.CanonicalTags
+		fmt.Printf("📚 Loaded %d canonical tags from dictionary\n", len(existingTags))
+	}
+
+	// Load the meeting
+	meeting, err := cache.LoadMeeting(meetingID)
+	if err != nil {
+		return fmt.Errorf("failed to load meeting %s: %w", meetingID, err)
+	}
+
+	// Parse transcript
+	if meeting.Resources.Transcript.Status != "uploaded" {
+		return fmt.Errorf("transcript not uploaded for %s (status: %s)", meetingID, meeting.Resources.Transcript.Status)
+	}
+	if meeting.Resources.Transcript.Content == "" {
+		return fmt.Errorf("transcript content empty for %s", meetingID)
+	}
+
+	var segments []Segment
+	if err := json.Unmarshal([]byte(meeting.Resources.Transcript.Content), &segments); err != nil {
+		return fmt.Errorf("error parsing transcript JSON for %s: %w", meetingID, err)
+	}
+
+	if len(segments) == 0 {
+		return fmt.Errorf("transcript has no segments for %s", meetingID)
+	}
+
+	// Build transcript with speaker names
+	var sb strings.Builder
+	for _, seg := range segments {
+		speakerName := fmt.Sprintf("Speaker %d", seg.SpeakerIndex)
+		if speakerInfo, ok := meeting.Speakers.Data[fmt.Sprintf("%d", seg.SpeakerIndex)]; ok {
+			speakerName = strings.TrimSpace(speakerInfo.Person.FirstName + " " + speakerInfo.Person.LastName)
+			if speakerName == "" {
+				speakerName = fmt.Sprintf("Speaker %d", seg.SpeakerIndex)
+			}
+		}
+		sb.WriteString(fmt.Sprintf("%s: %s\n", speakerName, seg.Speech.Text))
+	}
+	transcriptText := sb.String()
+
+	fmt.Printf("Summarizing meeting: %s\n", meetingID)
+
+	// Generate summary with Gemini
+	summaryResponse, err := summarizeWithGemini(ctx, transcriptText, existingTags)
+	if err != nil {
+		return fmt.Errorf("error generating summary: %w", err)
+	}
+
+	// Parse the summary response to SummaryData
+	summaryData := parseSummaryResponse(summaryResponse)
+
+	// Save summary to cache
+	if err := cache.SaveSummary(meetingID, summaryData); err != nil {
+		return fmt.Errorf("error saving summary: %w", err)
+	}
+
+	// Update sync state
+	syncState.SummarizedMeetings[meetingID] = true
+	if err := syncState.Save(); err != nil {
+		fmt.Printf("⚠ Warning: Could not save sync state: %v\n", err)
+	}
+
+	fmt.Printf("✅ Successfully summarized meeting: %s\n", meetingID)
+	return nil
 }

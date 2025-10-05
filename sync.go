@@ -19,12 +19,135 @@ var obsidianSummaryTemplate string
 //go:embed daily-note-template.md
 var dailyNoteTemplate string
 
+// MeetingWithSummary combines a meeting with its summary data
+type MeetingWithSummary struct {
+	Meeting     *Meeting
+	SummaryData *SummaryData
+}
+
 // Stage 3: Sync cached meetings and summaries to Obsidian
-func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, resync bool, testMode bool, cache *Cache) error {
+func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, resync bool, testMode bool, meetingID string, cache *Cache) error {
 	fmt.Println("\n=== Stage 3: Syncing to Obsidian ===")
 
+	// Handle single meeting mode
+	if meetingID != "" {
+		fmt.Printf("🎯 Single meeting mode: %s\n", meetingID)
+		if resync {
+			fmt.Println("🔄 Forcing re-sync of this meeting")
+			delete(syncState.ObsidianSyncedMeetings, meetingID)
+		}
+		// Process only this meeting
+		return syncSingleMeeting(ctx, meetingID, obsidianVaultPath, syncState, cache)
+	}
+
+	return runSyncInternal(ctx, obsidianVaultPath, limit, syncState, resync, testMode, meetingID, cache)
+}
+
+// fileExists checks if a file exists
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+// uniqueStrings removes duplicates from a string slice
+func uniqueStrings(slice []string) []string {
+	seen := make(map[string]bool)
+	result := []string{}
+	for _, val := range slice {
+		if !seen[val] {
+			seen[val] = true
+			result = append(result, val)
+		}
+	}
+	return result
+}
+
+func generateTranscriptContent(m *Meeting) string {
+	var sb strings.Builder
+
+	// Transcript header
+	timeStr := m.CreatedAt.Format("3:04 PM")
+	dateStr := m.CreatedAt.Format("Monday, January 2, 2006")
+	sb.WriteString(fmt.Sprintf("# %s - %s (Transcript)\n\n", timeStr, m.Title))
+	sb.WriteString(fmt.Sprintf("**Date**: %s\n", dateStr))
+	sb.WriteString(fmt.Sprintf("**Meeting ID**: `%s`\n\n", m.ID))
+
+	// Full transcript
+	if m.Resources.Transcript.Status == "uploaded" && m.Resources.Transcript.Content != "" {
+		var segments []Segment
+		if err := json.Unmarshal([]byte(m.Resources.Transcript.Content), &segments); err == nil && len(segments) > 0 {
+			sb.WriteString("## Transcript\n\n")
+
+			for _, segment := range segments {
+				timestamp := formatTimestamp(segment.Speech.Start)
+
+				// Get speaker name from the speakers map
+				speakerName := fmt.Sprintf("Speaker %d", segment.SpeakerIndex)
+				if speakerInfo, ok := m.Speakers.Data[fmt.Sprintf("%d", segment.SpeakerIndex)]; ok {
+					if speakerInfo.Person.FirstName != "" || speakerInfo.Person.LastName != "" {
+						speakerName = strings.TrimSpace(speakerInfo.Person.FirstName + " " + speakerInfo.Person.LastName)
+					}
+				}
+
+				sb.WriteString(fmt.Sprintf("**[%s] %s**: %s\n\n", timestamp, speakerName, segment.Speech.Text))
+			}
+		}
+	}
+
+	return sb.String()
+}
+
+// syncSingleMeeting syncs a single meeting by ID to Obsidian
+func syncSingleMeeting(ctx context.Context, meetingID string, obsidianVaultPath string, syncState *SyncState, cache *Cache) error {
+	// Temporarily add meeting to synced list if not there
+	if !syncState.SyncedMeetings[meetingID] {
+		return fmt.Errorf("meeting %s not found in sync state (run download first)", meetingID)
+	}
+
+	// Temporarily create a new sync state with just this meeting
+	tempState := &SyncState{
+		path:                   syncState.path,
+		SyncedMeetings:         map[string]bool{meetingID: true},
+		SummarizedMeetings:     syncState.SummarizedMeetings,
+		ObsidianSyncedMeetings: make(map[string]bool), // Empty so it processes this meeting
+		LastSyncTime:           syncState.LastSyncTime,
+	}
+
+	// Run the sync with limit 1 and test mode true to force overwrite
+	if err := runSyncInternal(ctx, obsidianVaultPath, 1, tempState, false, true, "", cache); err != nil {
+		return err
+	}
+
+	// Update the real sync state (we do this manually since test mode doesn't update state)
+	syncState.ObsidianSyncedMeetings[meetingID] = true
+	if err := syncState.Save(); err != nil {
+		return fmt.Errorf("failed to save sync state: %w", err)
+	}
+
+	return nil
+}
+
+// runSyncInternal is the internal sync logic extracted for reuse
+func runSyncInternal(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, resync bool, testMode bool, meetingID string, cache *Cache) error {
 	if testMode {
 		fmt.Println("🧪 Test mode: will overwrite files without updating state")
+	}
+
+	// Load tags dictionary if it exists (for applying mappings)
+	tagsDict, err := loadTagsDictionary()
+	var tagMappings map[string]string // Reverse lookup: old tag -> canonical tag
+	if err != nil {
+		fmt.Printf("⚠ Warning: Could not load tags dictionary: %v\n", err)
+		fmt.Println("  Tags will be written as-is without normalization")
+	} else if tagsDict != nil {
+		fmt.Printf("📚 Loaded tags dictionary with %d canonical tags\n", len(tagsDict.CanonicalTags))
+		// Build reverse lookup map
+		tagMappings = make(map[string]string)
+		for canonical, oldTags := range tagsDict.Mappings {
+			for _, oldTag := range oldTags {
+				tagMappings[oldTag] = canonical
+			}
+		}
 	}
 
 	// If resync flag is set, clear the Obsidian sync state
@@ -34,11 +157,6 @@ func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState
 	}
 
 	// Get list of meetings that need to be synced to Obsidian and load them
-	type MeetingWithSummary struct {
-		Meeting     *Meeting
-		SummaryData *SummaryData
-	}
-
 	var toSync []*MeetingWithSummary
 	for id := range syncState.SyncedMeetings {
 		// In test mode, include all meetings; otherwise only unsynced ones
@@ -173,11 +291,21 @@ func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState
 			summary := ""
 			if mws.SummaryData != nil {
 				description = mws.SummaryData.Description
-				// Split comma-separated tags into array
+				// Split comma-separated tags into array and apply mappings
 				if mws.SummaryData.Tags != "" {
 					for _, tag := range strings.Split(mws.SummaryData.Tags, ",") {
-						tags = append(tags, strings.TrimSpace(tag))
+						tag = strings.TrimSpace(tag)
+						// Apply mapping if dictionary exists
+						if tagMappings != nil {
+							if canonical, ok := tagMappings[tag]; ok {
+								tag = canonical
+							}
+						}
+						tags = append(tags, tag)
 					}
+					// Remove duplicates after mapping
+					tags = uniqueStrings(tags)
+					sort.Strings(tags)
 				}
 				summary = mws.SummaryData.Summary
 			}
@@ -292,45 +420,4 @@ func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState
 
 	fmt.Printf("\n✅ Synced %d meeting(s) to %d daily note(s)\n", successCount, len(meetingsByDate))
 	return nil
-}
-
-// fileExists checks if a file exists
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
-}
-
-func generateTranscriptContent(m *Meeting) string {
-	var sb strings.Builder
-
-	// Transcript header
-	timeStr := m.CreatedAt.Format("3:04 PM")
-	dateStr := m.CreatedAt.Format("Monday, January 2, 2006")
-	sb.WriteString(fmt.Sprintf("# %s - %s (Transcript)\n\n", timeStr, m.Title))
-	sb.WriteString(fmt.Sprintf("**Date**: %s\n", dateStr))
-	sb.WriteString(fmt.Sprintf("**Meeting ID**: `%s`\n\n", m.ID))
-
-	// Full transcript
-	if m.Resources.Transcript.Status == "uploaded" && m.Resources.Transcript.Content != "" {
-		var segments []Segment
-		if err := json.Unmarshal([]byte(m.Resources.Transcript.Content), &segments); err == nil && len(segments) > 0 {
-			sb.WriteString("## Transcript\n\n")
-
-			for _, segment := range segments {
-				timestamp := formatTimestamp(segment.Speech.Start)
-
-				// Get speaker name from the speakers map
-				speakerName := fmt.Sprintf("Speaker %d", segment.SpeakerIndex)
-				if speakerInfo, ok := m.Speakers.Data[fmt.Sprintf("%d", segment.SpeakerIndex)]; ok {
-					if speakerInfo.Person.FirstName != "" || speakerInfo.Person.LastName != "" {
-						speakerName = strings.TrimSpace(speakerInfo.Person.FirstName + " " + speakerInfo.Person.LastName)
-					}
-				}
-
-				sb.WriteString(fmt.Sprintf("**[%s] %s**: %s\n\n", timestamp, speakerName, segment.Speech.Text))
-			}
-		}
-	}
-
-	return sb.String()
 }

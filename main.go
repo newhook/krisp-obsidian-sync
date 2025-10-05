@@ -29,10 +29,12 @@ var (
 func main() {
 	// Parse command-line flags
 	limitFlag := flag.Int("limit", 1, "Number of meetings to process (default: 1 for testing)")
-	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, normalize, repair, or all (default: all)")
+	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, normalize, normalize-prompt, normalize-consume, normalize-apply, repair, or all (default: all)")
 	resyncFlag := flag.Bool("resync", false, "Force re-sync all meetings to Obsidian, ignoring sync state")
 	resummarizeFlag := flag.Bool("resummarize", false, "Force re-summarize all meetings, ignoring summarization state")
 	testFlag := flag.Bool("test", false, "Test mode: create a single test file without updating state (sync stage only)")
+	applyFlag := flag.Bool("apply", false, "Apply normalization proposal (normalize stage only)")
+	meetingIDFlag := flag.String("meeting", "", "Process a specific meeting ID (for resummarize/resync single meeting)")
 	flag.Parse()
 
 	// Load environment variables from .env file
@@ -92,7 +94,7 @@ func main() {
 
 	// Stage 2: Summarize
 	if runAll || step == "summarize" {
-		if err := runSummarize(ctx, *limitFlag, syncState, *resummarizeFlag, cache); err != nil {
+		if err := runSummarize(ctx, *limitFlag, syncState, *resummarizeFlag, *meetingIDFlag, cache); err != nil {
 			fmt.Printf("❌ Error in summarize stage: %v\n", err)
 			return
 		}
@@ -100,16 +102,33 @@ func main() {
 
 	// Stage 3: Sync
 	if runAll || step == "sync" {
-		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *resyncFlag, *testFlag, cache); err != nil {
+		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *resyncFlag, *testFlag, *meetingIDFlag, cache); err != nil {
 			fmt.Printf("❌ Error in sync stage: %v\n", err)
 			return
 		}
 	}
 
-	// Stage 4: Normalize tags
-	if runAll || step == "normalize" {
-		if err := runNormalize(ctx, cache); err != nil {
-			fmt.Printf("❌ Error in normalize stage: %v\n", err)
+	// Stage 4: Normalize tags (3 sub-steps)
+	if step == "normalize-prompt" {
+		// Step 1: Generate prompt
+		if err := runNormalizePrompt(ctx, cache); err != nil {
+			fmt.Printf("❌ Error generating normalization prompt: %v\n", err)
+			return
+		}
+	}
+
+	if step == "normalize-consume" {
+		// Step 2: Consume LLM result
+		if err := runNormalizeConsume(ctx, cache); err != nil {
+			fmt.Printf("❌ Error consuming LLM result: %v\n", err)
+			return
+		}
+	}
+
+	if step == "normalize-apply" || *applyFlag {
+		// Step 3: Apply proposal
+		if err := runNormalizeApply(ctx, cache); err != nil {
+			fmt.Printf("❌ Error applying normalization: %v\n", err)
 			return
 		}
 	}

@@ -13,25 +13,32 @@ import (
 	"text/template"
 	"time"
 
-	"google.golang.org/genai"
+	"github.com/lithammer/fuzzysearch/fuzzy"
 )
 
 //go:embed normalize-prompt.md
 var normalizePromptTemplate string
 
 const tagsDictionaryFile = "tags-dictionary.json"
+const tagsProposalFile = "tags-proposal.json"
+
+// tagInfo represents a tag with its occurrence count
+type tagInfo struct {
+	Tag   string
+	Count int
+}
 
 // TagsDictionary holds the canonical tag set and mappings
 type TagsDictionary struct {
-	CanonicalTags  []string          `json:"canonical_tags"`
-	Mappings       map[string]string `json:"mappings"` // old tag -> canonical tag
-	LastNormalized time.Time         `json:"last_normalized"`
-	MeetingCount   int               `json:"meeting_count"`
+	CanonicalTags  []string            `json:"canonical_tags"`
+	Mappings       map[string][]string `json:"mappings"` // canonical tag -> list of original tags
+	LastNormalized time.Time           `json:"last_normalized"`
+	MeetingCount   int                 `json:"meeting_count"`
 }
 
-// Stage 4: Normalize tags across all cached summaries
-func runNormalize(ctx context.Context, cache *Cache) error {
-	fmt.Println("\n=== Stage 4: Normalizing tags ===")
+// Stage 4.1: Generate normalization prompt
+func runNormalizePrompt(ctx context.Context, cache *Cache) error {
+	fmt.Println("\n=== Stage 4.1: Generate Normalization Prompt ===")
 
 	// Get all cached summary files
 	files, err := filepath.Glob(filepath.Join(meetingsCacheDir, "*-summary.json"))
@@ -94,82 +101,7 @@ func runNormalize(ctx context.Context, cache *Cache) error {
 
 	fmt.Printf("📊 Found %d unique tags across all meetings\n", len(tagCounts))
 
-	// Consolidate tags using LLM
-	fmt.Println("🤖 Consolidating tags with Gemini...")
-	canonicalTags, mappings, err := consolidateTagsWithLLM(ctx, tagCounts)
-	if err != nil {
-		return fmt.Errorf("error consolidating tags: %w", err)
-	}
-
-	fmt.Printf("✓ Consolidated to %d canonical tags\n", len(canonicalTags))
-
-	// Update all summary files with canonical tags
-	fmt.Println("📝 Updating cached summaries with canonical tags...")
-	updatedCount := 0
-	for _, ms := range summaries {
-		// Apply tag mappings
-		if ms.SummaryData.Tags != "" {
-			tags := strings.Split(ms.SummaryData.Tags, ",")
-			var normalizedTags []string
-			for _, tag := range tags {
-				tag = strings.TrimSpace(tag)
-				if canonical, ok := mappings[tag]; ok {
-					normalizedTags = append(normalizedTags, canonical)
-				} else {
-					normalizedTags = append(normalizedTags, tag)
-				}
-			}
-
-			// Remove duplicates and sort
-			normalizedTags = unique(normalizedTags)
-			sort.Strings(normalizedTags)
-
-			ms.SummaryData.Tags = strings.Join(normalizedTags, ", ")
-
-			if err := cache.SaveSummary(ms.MeetingID, ms.SummaryData); err != nil {
-				fmt.Printf("⚠ Error updating summary for %s: %v\n", ms.MeetingID, err)
-				continue
-			}
-
-			updatedCount++
-		}
-	}
-
-	fmt.Printf("✓ Updated %d summaries\n", updatedCount)
-
-	// Save tags dictionary
-	dictionary := &TagsDictionary{
-		CanonicalTags:  canonicalTags,
-		Mappings:       mappings,
-		LastNormalized: time.Now(),
-		MeetingCount:   len(files),
-	}
-
-	if err := saveTagsDictionary(dictionary); err != nil {
-		return fmt.Errorf("error saving tags dictionary: %w", err)
-	}
-
-	fmt.Printf("✓ Saved tags dictionary: %s\n", tagsDictionaryFile)
-	fmt.Printf("\n✅ Normalization complete! %d canonical tags established.\n", len(canonicalTags))
-
-	return nil
-}
-
-func consolidateTagsWithLLM(ctx context.Context, tagCounts map[string]int) ([]string, map[string]string, error) {
-	client, err := genai.NewClient(ctx, &genai.ClientConfig{
-		Project:  gcpProject,
-		Location: gcpLocation,
-		Backend:  genai.BackendVertexAI,
-	})
-	if err != nil {
-		return nil, nil, fmt.Errorf("failed to create Vertex AI client: %w", err)
-	}
-
 	// Build tag list sorted by frequency
-	type tagInfo struct {
-		Tag   string
-		Count int
-	}
 	var tagList []tagInfo
 	for tag, count := range tagCounts {
 		tagList = append(tagList, tagInfo{Tag: tag, Count: count})
@@ -178,71 +110,437 @@ func consolidateTagsWithLLM(ctx context.Context, tagCounts map[string]int) ([]st
 		return tagList[i].Count > tagList[j].Count
 	})
 
-	// Parse the normalize prompt template
+	// Pre-process with fuzzy matching to consolidate obvious duplicates
+	fmt.Println("\n🔍 Pre-processing with fuzzy matching...")
+	tagList, preMappings := fuzzyPreProcess(tagList)
+	fmt.Printf("✓ Fuzzy matching reduced %d tags to %d (%.1f%% reduction)\n",
+		len(tagCounts), len(tagList), (1-float64(len(tagList))/float64(len(tagCounts)))*100)
+
+	// Save fuzzy pre-mappings for later use
+	preMappingsData, err := json.MarshalIndent(preMappings, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal pre-mappings: %w", err)
+	}
+	if err := os.WriteFile("normalize-premappings.json", preMappingsData, 0644); err != nil {
+		return fmt.Errorf("failed to write pre-mappings: %w", err)
+	}
+
+	// Generate prompt for LLM
+	fmt.Println("\n📝 Generating normalization prompt...")
+	prompt, err := generateNormalizePrompt(tagList)
+	if err != nil {
+		return fmt.Errorf("failed to generate prompt: %w", err)
+	}
+
+	if err := os.WriteFile("normalize-prompt-generated.txt", []byte(prompt), 0644); err != nil {
+		return fmt.Errorf("failed to write prompt file: %w", err)
+	}
+
+	fmt.Println("\n✅ Normalization prompt generated!")
+	fmt.Printf("   - Pre-mappings saved to: normalize-premappings.json\n")
+	fmt.Printf("   - Prompt saved to: normalize-prompt-generated.txt\n")
+	fmt.Printf("   - %d tags to consolidate\n", len(tagList))
+	fmt.Println("\nNext: Run your LLM on the prompt and save result to llm-result.json")
+
+	return nil
+}
+
+// Stage 4.2: Consume LLM result and create proposal
+func runNormalizeConsume(_ context.Context, _ *Cache) error {
+	fmt.Println("\n=== Stage 4.2: Consume LLM Result ===")
+
+	// Load pre-mappings
+	preMappingsData, err := os.ReadFile("normalize-premappings.json")
+	if err != nil {
+		return fmt.Errorf("failed to read normalize-premappings.json: %w (run normalize-prompt first)", err)
+	}
+
+	var preMappingsArray []struct {
+		CanonicalTag string   `json:"canonical_tag"`
+		OldTags      []string `json:"old_tags"`
+	}
+	if err := json.Unmarshal(preMappingsData, &preMappingsArray); err != nil {
+		return fmt.Errorf("failed to parse pre-mappings: %w", err)
+	}
+
+	// Convert to map
+	preMappings := make(map[string][]string)
+	for _, entry := range preMappingsArray {
+		var oldTags []string
+		for _, oldTag := range entry.OldTags {
+			if oldTag != entry.CanonicalTag {
+				oldTags = append(oldTags, oldTag)
+			}
+		}
+		if len(oldTags) > 0 {
+			preMappings[entry.CanonicalTag] = oldTags
+		}
+	}
+
+	// Load LLM result
+	llmResultData, err := os.ReadFile("llm-result.json")
+	if err != nil {
+		return fmt.Errorf("failed to read llm-result.json: %w", err)
+	}
+
+	var llmResult []struct {
+		CanonicalTag string   `json:"canonical_tag"`
+		OldTags      []string `json:"old_tags"`
+	}
+
+	if err := json.Unmarshal(llmResultData, &llmResult); err != nil {
+		return fmt.Errorf("failed to parse llm-result.json: %w", err)
+	}
+
+	// Build canonical tags and mappings
+	var canonicalTags []string
+	llmMappings := make(map[string][]string)
+
+	for _, entry := range llmResult {
+		canonicalTags = append(canonicalTags, entry.CanonicalTag)
+
+		// Filter out the canonical tag itself from old_tags (only keep actual changes)
+		var oldTags []string
+		for _, oldTag := range entry.OldTags {
+			if oldTag != entry.CanonicalTag {
+				oldTags = append(oldTags, oldTag)
+			}
+		}
+		if len(oldTags) > 0 {
+			llmMappings[entry.CanonicalTag] = oldTags
+		}
+	}
+
+	fmt.Printf("✓ LLM returned %d canonical tags with %d mappings\n", len(canonicalTags), len(llmMappings))
+
+	// Merge pre-mappings with LLM mappings
+	finalMappings := make(map[string][]string)
+	for canonical, intermediates := range llmMappings {
+		var allOriginals []string
+		for _, intermediate := range intermediates {
+			// Check if this intermediate was itself consolidated from other tags
+			if originals, ok := preMappings[intermediate]; ok {
+				allOriginals = append(allOriginals, originals...)
+			} else {
+				allOriginals = append(allOriginals, intermediate)
+			}
+		}
+		finalMappings[canonical] = allOriginals
+	}
+
+	// Also include any pre-mappings for tags that weren't further consolidated
+	for canonical, originals := range preMappings {
+		if _, exists := finalMappings[canonical]; !exists {
+			// Check if this canonical tag still exists in the final set
+			stillExists := false
+			for _, tag := range canonicalTags {
+				if tag == canonical {
+					stillExists = true
+					break
+				}
+			}
+			if stillExists {
+				finalMappings[canonical] = originals
+			}
+		}
+	}
+
+	mappings := finalMappings
+
+	// Get meeting count
+	files, err := filepath.Glob(filepath.Join(meetingsCacheDir, "*-summary.json"))
+	if err != nil {
+		return fmt.Errorf("error reading cache directory: %w", err)
+	}
+
+	// Create proposal
+	proposal := &TagsDictionary{
+		CanonicalTags:  canonicalTags,
+		Mappings:       mappings,
+		LastNormalized: time.Now(),
+		MeetingCount:   len(files),
+	}
+
+	// Save proposal
+	if err := saveTagsProposal(proposal); err != nil {
+		return fmt.Errorf("error saving tags proposal: %w", err)
+	}
+
+	fmt.Printf("\n✅ Normalization proposal created!\n")
+	fmt.Printf("   - %d canonical tags\n", len(canonicalTags))
+	fmt.Printf("   - %d mappings\n", len(mappings))
+	fmt.Printf("   - Saved to: %s\n", tagsProposalFile)
+	fmt.Println("\nNext: Review tags-proposal.json, then run: go run . --step normalize-apply")
+
+	return nil
+}
+
+// generateNormalizePrompt creates the normalization prompt from tag list
+func generateNormalizePrompt(tagList []tagInfo) (string, error) {
 	tmpl, err := template.New("normalize").Parse(normalizePromptTemplate)
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to parse normalize template: %w", err)
+		return "", fmt.Errorf("failed to parse normalize template: %w", err)
 	}
 
-	// Execute template with tag data
 	var promptBuf bytes.Buffer
 	if err := tmpl.Execute(&promptBuf, map[string]interface{}{"Tags": tagList}); err != nil {
-		return nil, nil, fmt.Errorf("failed to execute normalize template: %w", err)
-	}
-	prompt := promptBuf.String()
-
-	// Define JSON schema for response
-	schema := &genai.Schema{
-		Type: genai.TypeObject,
-		Properties: map[string]*genai.Schema{
-			"canonical_tags": {
-				Type:        genai.TypeArray,
-				Description: "List of canonical tags to use",
-				Items: &genai.Schema{
-					Type: genai.TypeString,
-				},
-			},
-			"mappings": {
-				Type:        genai.TypeObject,
-				Description: "Map of old tags to canonical tags (only include tags that need mapping)",
-			},
-		},
-		Required: []string{"canonical_tags", "mappings"},
+		return "", fmt.Errorf("failed to execute normalize template: %w", err)
 	}
 
-	resp, err := client.Models.GenerateContent(ctx, "gemini-2.0-flash-lite", []*genai.Content{
-		{
-			Role: "user",
-			Parts: []*genai.Part{
-				genai.NewPartFromText(prompt),
-			},
-		},
-	}, &genai.GenerateContentConfig{
-		Temperature:      func() *float32 { v := float32(0.3); return &v }(),
-		MaxOutputTokens:  4096,
-		ResponseMIMEType: "application/json",
-		ResponseSchema:   schema,
-	})
+	return promptBuf.String(), nil
+}
+
+/* OLD CODE - Multi-pass chunked consolidation (COMMENTED OUT FOR NOW)
+// Iteratively consolidate tags until no more consolidation happens
+const chunkSize = 50              // Reduced to avoid LLM hallucination
+const minConsolidationRatio = 0.9 // Stop if we're keeping > 90% of tags (not much consolidation)
+
+currentTags := tagList
+allMappings := make(map[string][]string)
+passNum := 1
+
+for {
+	numChunks := (len(currentTags) + chunkSize - 1) / chunkSize
+	fmt.Printf("\n🤖 Pass %d: Consolidating %d tags in %d chunk(s)...\n", passNum, len(currentTags), numChunks)
+
+	var passCanonicalTags []string
+	passMappings := make(map[string][]string)
+	var unmappedTags []tagInfo // Tags that weren't mapped by LLM
+
+	// Prepare chunks
+	type chunkResult struct {
+		index         int
+		canonicalTags []string
+		mappings      map[string][]string
+		unmappedTags  []tagInfo
+		err           error
+	}
+
+	var chunks [][]tagInfo
+	for i := 0; i < len(currentTags); i += chunkSize {
+		end := i + chunkSize
+		if end > len(currentTags) {
+			end = len(currentTags)
+		}
+		chunks = append(chunks, currentTags[i:end])
+	}
+
+	// Process chunks in parallel
+	const maxConcurrency = 5
+	semaphore := make(chan struct{}, maxConcurrency)
+	results := make(chan chunkResult, len(chunks))
+
+	for chunkIdx, chunk := range chunks {
+		semaphore <- struct{}{}
+
+		go func(idx int, chunkTags []tagInfo) {
+			defer func() { <-semaphore }()
+
+			fmt.Printf("  [%d/%d] Processing %d tags...\n", idx+1, len(chunks), len(chunkTags))
+
+			chunkTagCounts := make(map[string]int)
+			for _, t := range chunkTags {
+				chunkTagCounts[t.Tag] = t.Count
+			}
+
+			// Retry up to 3 times
+			var canonicalTags []string
+			var mappings map[string][]string
+			var err error
+			var chunkUnmapped []tagInfo
+
+			for attempt := 1; attempt <= 3; attempt++ {
+				canonicalTags, mappings, err = consolidateTagsWithLLM(ctx, chunkTagCounts)
+				if err == nil {
+					fmt.Printf("  📊 Chunk %d: LLM returned %d canonical tags with %d mappings\n", idx+1, len(canonicalTags), len(mappings))
+
+					// Check for missing tags
+					mappedTags := make(map[string]bool)
+					for _, canonical := range canonicalTags {
+						mappedTags[canonical] = true
+					}
+					for _, oldTags := range mappings {
+						for _, tag := range oldTags {
+							mappedTags[tag] = true
+						}
+					}
+
+					missingCount := 0
+					for _, t := range chunkTags {
+						if !mappedTags[t.Tag] {
+							chunkUnmapped = append(chunkUnmapped, t)
+							missingCount++
+						}
+					}
+					if missingCount > 0 {
+						fmt.Printf("  ⚠ Chunk %d: %d tags missing, will retry in next pass\n", idx+1, missingCount)
+					}
+					break
+				}
+				if attempt < 3 {
+					fmt.Printf("  ⚠ Chunk %d attempt %d failed: %v, retrying...\n", idx+1, attempt, err)
+				}
+			}
+
+			results <- chunkResult{
+				index:         idx,
+				canonicalTags: canonicalTags,
+				mappings:      mappings,
+				unmappedTags:  chunkUnmapped,
+				err:           err,
+			}
+		}(chunkIdx, chunk)
+	}
+
+	// Collect results
+	for i := 0; i < len(chunks); i++ {
+		res := <-results
+		if res.err != nil {
+			return fmt.Errorf("error consolidating chunk %d in pass %d: %w", res.index+1, passNum, res.err)
+		}
+
+		passCanonicalTags = append(passCanonicalTags, res.canonicalTags...)
+		unmappedTags = append(unmappedTags, res.unmappedTags...)
+		for canonical, oldTags := range res.mappings {
+			passMappings[canonical] = append(passMappings[canonical], oldTags...)
+		}
+		fmt.Printf("  ✓ Chunk %d complete: %d canonical tags\n", res.index+1, len(res.canonicalTags))
+	}
+
+	// Add unmapped tags to the canonical list for next pass
+	if len(unmappedTags) > 0 {
+		fmt.Printf("  ⚠ %d tag(s) not mapped by LLM, will retry in next pass\n", len(unmappedTags))
+		for _, t := range unmappedTags {
+			passCanonicalTags = append(passCanonicalTags, t.Tag)
+		}
+	}
+
+	// Check if we made meaningful progress
+	inputTagCount := len(currentTags)
+	outputTagCount := len(passCanonicalTags)
+	consolidationRatio := float64(outputTagCount) / float64(inputTagCount)
+
+	fmt.Printf("✓ Pass %d complete: %d → %d canonical tags (%.1f%% reduction)\n",
+		passNum, inputTagCount, outputTagCount, (1-consolidationRatio)*100)
+
+	// Update global mappings
+	if passNum == 1 {
+		// First pass: direct mappings
+		allMappings = passMappings
+	} else {
+		// Subsequent passes: chain mappings (canonical -> [intermediates] -> [originals])
+		newMappings := make(map[string][]string)
+
+		// For each new canonical tag in this pass
+		for newCanonical, intermediates := range passMappings {
+			var allOriginals []string
+			for _, intermediate := range intermediates {
+				// Check if this intermediate was itself a canonical tag with mappings
+				if originals, ok := allMappings[intermediate]; ok {
+					allOriginals = append(allOriginals, originals...)
+				} else {
+					allOriginals = append(allOriginals, intermediate)
+				}
+			}
+			newMappings[newCanonical] = allOriginals
+		}
+
+		// Keep any mappings from previous pass that weren't consolidated in this pass
+		for canonical, originals := range allMappings {
+			// Check if this canonical tag still exists (wasn't consolidated)
+			stillExists := false
+			for newCanonical := range passMappings {
+				if canonical == newCanonical {
+					stillExists = true
+					break
+				}
+			}
+			if stillExists && newMappings[canonical] == nil {
+				newMappings[canonical] = originals
+			}
+		}
+
+		allMappings = newMappings
+	}
+
+	// Stop if we're not consolidating much anymore
+	if consolidationRatio >= minConsolidationRatio {
+		fmt.Printf("⚠ Minimal consolidation (%.1f%% kept), stopping\n", consolidationRatio*100)
+		// Use the output from this pass as final
+		currentTags = make([]tagInfo, len(passCanonicalTags))
+		for i, tag := range passCanonicalTags {
+			currentTags[i] = tagInfo{Tag: tag, Count: 1}
+		}
+		break
+	}
+
+	// Prepare for next pass
+	currentTags = make([]tagInfo, len(passCanonicalTags))
+	for i, tag := range passCanonicalTags {
+		currentTags[i] = tagInfo{Tag: tag, Count: 1} // Equal weight
+	}
+
+	passNum++
+}
+... (rest of old multi-pass code)
+*/
+// END OLD CODE
+
+// Stage 4.3: Apply normalization proposal (write tags dictionary)
+func runNormalizeApply(_ context.Context, _ *Cache) error {
+	fmt.Println("\n=== Applying normalization proposal ===")
+
+	// Load proposal
+	proposal, err := loadTagsProposal()
 	if err != nil {
-		return nil, nil, fmt.Errorf("failed to consolidate tags: %w", err)
+		return fmt.Errorf("error loading proposal: %w", err)
 	}
 
-	if len(resp.Candidates) == 0 || len(resp.Candidates[0].Content.Parts) == 0 {
-		return nil, nil, fmt.Errorf("no response generated")
+	fmt.Printf("Loaded proposal: %d canonical tags, %d mappings\n", len(proposal.CanonicalTags), len(proposal.Mappings))
+
+	// Display canonical tags
+	fmt.Println("\n📋 Canonical tags:")
+	for _, tag := range proposal.CanonicalTags {
+		fmt.Printf("  - %s\n", tag)
 	}
 
-	responseText := fmt.Sprintf("%v", resp.Candidates[0].Content.Parts[0].Text)
-
-	var result struct {
-		CanonicalTags []string          `json:"canonical_tags"`
-		Mappings      map[string]string `json:"mappings"`
+	// Save as tags dictionary (this will be used by sync to apply mappings)
+	if err := saveTagsDictionary(proposal); err != nil {
+		return fmt.Errorf("error saving tags dictionary: %w", err)
 	}
 
-	if err := json.Unmarshal([]byte(responseText), &result); err != nil {
-		return nil, nil, fmt.Errorf("failed to parse response: %w", err)
+	fmt.Printf("\n✓ Saved tags dictionary: %s\n", tagsDictionaryFile)
+	fmt.Printf("✅ Tag normalization approved! Mappings will be applied during sync to Obsidian.\n")
+	fmt.Printf("   Summaries remain unchanged - mappings are applied only when writing to Obsidian.\n")
+
+	return nil
+}
+
+func saveTagsProposal(dict *TagsDictionary) error {
+	data, err := json.MarshalIndent(dict, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal proposal: %w", err)
 	}
 
-	return result.CanonicalTags, result.Mappings, nil
+	if err := os.WriteFile(tagsProposalFile, data, 0644); err != nil {
+		return fmt.Errorf("failed to write proposal file: %w", err)
+	}
+
+	return nil
+}
+
+func loadTagsProposal() (*TagsDictionary, error) {
+	data, err := os.ReadFile(tagsProposalFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read proposal file: %w (run normalize first to generate proposal)", err)
+	}
+
+	var dict TagsDictionary
+	if err := json.Unmarshal(data, &dict); err != nil {
+		return nil, fmt.Errorf("failed to parse proposal: %w", err)
+	}
+
+	return &dict, nil
 }
 
 func saveTagsDictionary(dict *TagsDictionary) error {
@@ -275,15 +573,200 @@ func loadTagsDictionary() (*TagsDictionary, error) {
 	return &dict, nil
 }
 
-// unique removes duplicates from a string slice
-func unique(slice []string) []string {
-	seen := make(map[string]bool)
-	result := []string{}
-	for _, val := range slice {
-		if !seen[val] {
-			seen[val] = true
-			result = append(result, val)
+// fuzzyPreProcess consolidates tags using fuzzy matching for obvious duplicates
+// Returns consolidated tag list and mappings (canonical -> [originals])
+func fuzzyPreProcess(tags []tagInfo) ([]tagInfo, map[string][]string) {
+	type tagGroup struct {
+		canonical  string
+		tags       []tagInfo
+		totalCount int
+	}
+
+	groups := make(map[string]*tagGroup)
+	mappings := make(map[string][]string)
+
+	for _, tag := range tags {
+		normalized := strings.ToLower(strings.ReplaceAll(tag.Tag, "-", ""))
+
+		// Check for exact match on normalized form (catches case and hyphen variations)
+		var matchedGroup *tagGroup
+		for _, group := range groups {
+			groupNorm := strings.ToLower(strings.ReplaceAll(group.canonical, "-", ""))
+
+			// Exact normalized match
+			if normalized == groupNorm {
+				matchedGroup = group
+				break
+			}
+
+			// Fuzzy match with high threshold (Levenshtein distance <= 2 for similar length)
+			if len(normalized) > 3 && fuzzy.LevenshteinDistance(normalized, groupNorm) <= 2 {
+				// Only match if they're similar length (within 20%)
+				lenDiff := abs(len(normalized) - len(groupNorm))
+				maxLen := maxInt(len(normalized), len(groupNorm))
+				if float64(lenDiff)/float64(maxLen) <= 0.2 {
+					matchedGroup = group
+					break
+				}
+			}
+
+			// Enhanced singular/plural matching
+			if isSingularPlural(normalized, groupNorm) {
+				matchedGroup = group
+				break
+			}
+
+			// Check for common verb/noun variations (e.g., "planning" vs "plan", "testing" vs "test")
+			if isVerbNounVariation(normalized, groupNorm) {
+				matchedGroup = group
+				break
+			}
+
+			// Check if one is a substring of the other (with constraints)
+			// e.g., "api" vs "api-integration", but only if one is significantly shorter
+			if len(normalized) > 3 && len(groupNorm) > 3 {
+				shorter := normalized
+				longer := groupNorm
+				if len(groupNorm) < len(normalized) {
+					shorter = groupNorm
+					longer = normalized
+				}
+				// If shorter is at least 4 chars and appears at start of longer
+				if len(shorter) >= 4 && strings.HasPrefix(longer, shorter) {
+					// Only match if the extension is common (like "ing", "s", "tion", etc)
+					suffix := strings.TrimPrefix(longer, shorter)
+					if isCommonSuffix(suffix) {
+						matchedGroup = group
+						break
+					}
+				}
+			}
+		}
+
+		if matchedGroup != nil {
+			// Add to existing group
+			matchedGroup.tags = append(matchedGroup.tags, tag)
+			matchedGroup.totalCount += tag.Count
+		} else {
+			// Create new group
+			groups[tag.Tag] = &tagGroup{
+				canonical:  tag.Tag,
+				tags:       []tagInfo{tag},
+				totalCount: tag.Count,
+			}
 		}
 	}
-	return result
+
+	// Build consolidated list and mappings
+	var consolidated []tagInfo
+	for _, group := range groups {
+		consolidated = append(consolidated, tagInfo{
+			Tag:   group.canonical,
+			Count: group.totalCount,
+		})
+
+		// Only create mapping if we actually consolidated multiple tags
+		if len(group.tags) > 1 {
+			var originals []string
+			for _, t := range group.tags {
+				if t.Tag != group.canonical {
+					originals = append(originals, t.Tag)
+				}
+			}
+			if len(originals) > 0 {
+				mappings[group.canonical] = originals
+			}
+		}
+	}
+
+	// Sort by frequency
+	sort.Slice(consolidated, func(i, j int) bool {
+		return consolidated[i].Count > consolidated[j].Count
+	})
+
+	return consolidated, mappings
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+// isSingularPlural checks if two normalized strings are singular/plural variations
+func isSingularPlural(a, b string) bool {
+	// Simple plural: just add 's'
+	if a+"s" == b || b+"s" == a {
+		return true
+	}
+	// -es plural (e.g., "batch" -> "batches")
+	if a+"es" == b || b+"es" == a {
+		return true
+	}
+	// -ies plural (e.g., "query" -> "queries")
+	if len(a) > 2 && len(b) > 2 {
+		if strings.HasSuffix(a, "y") && strings.TrimSuffix(a, "y")+"ies" == b {
+			return true
+		}
+		if strings.HasSuffix(b, "y") && strings.TrimSuffix(b, "y")+"ies" == a {
+			return true
+		}
+	}
+	return false
+}
+
+// isVerbNounVariation checks for common verb/noun variations
+func isVerbNounVariation(a, b string) bool {
+	// -ing variations (e.g., "plan" -> "planning")
+	if strings.HasSuffix(a, "ing") {
+		base := strings.TrimSuffix(a, "ing")
+		// Handle doubled consonants (e.g., "running" -> "run")
+		if len(base) > 0 && base == b {
+			return true
+		}
+		if len(base) > 1 && base[:len(base)-1] == b {
+			return true
+		}
+	}
+	if strings.HasSuffix(b, "ing") {
+		base := strings.TrimSuffix(b, "ing")
+		if len(base) > 0 && base == a {
+			return true
+		}
+		if len(base) > 1 && base[:len(base)-1] == a {
+			return true
+		}
+	}
+
+	// -ed variations (e.g., "deploy" -> "deployed")
+	if strings.HasSuffix(a, "ed") && strings.TrimSuffix(a, "ed") == b {
+		return true
+	}
+	if strings.HasSuffix(b, "ed") && strings.TrimSuffix(b, "ed") == a {
+		return true
+	}
+
+	return false
+}
+
+// isCommonSuffix checks if a string is a common suffix that indicates related tags
+func isCommonSuffix(s string) bool {
+	commonSuffixes := []string{
+		"s", "es", "ing", "ed", "er", "ers", "tion", "sion",
+		"ment", "ness", "ity", "age", "al", "ance", "ence",
+	}
+	for _, suffix := range commonSuffixes {
+		if s == suffix {
+			return true
+		}
+	}
+	return false
 }

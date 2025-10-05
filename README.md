@@ -60,7 +60,10 @@ go build -o krisp-sync .
   - `download` - Download meetings from Krisp API to local cache
   - `summarize` - Generate AI summaries for cached meetings
   - `sync` - Sync cached meetings and summaries to Obsidian
-  - `normalize` - Normalize tags across all summaries
+  - `normalize-prompt` - Generate tag normalization prompt
+  - `normalize-consume` - Consume LLM result and create proposal
+  - `normalize-apply` - Apply normalization proposal and write tags dictionary
+  - `repair` - Sync filesystem state with tracking state
 
 - `--limit <n>` - Number of meetings to process (default: `1` for testing)
   - Set to `0` to process all available meetings
@@ -81,6 +84,11 @@ go build -o krisp-sync .
   - Processes the oldest meeting
   - Can be run repeatedly for testing templates
   - Does not mark meetings as synced
+
+- `--meeting <meeting-id>` - Process a specific meeting by ID
+  - Works with `--resummarize` to re-summarize a single meeting
+  - Works with `--resync` to re-sync a single meeting to Obsidian
+  - Useful for fixing issues with individual meetings
 
 ## How It Works
 
@@ -155,18 +163,56 @@ SORT time ASC
 - Skips existing files (never overwrites)
 - Tracks synced meetings in state file
 
-### Stage 4: Normalize
+### Stage 4: Normalize Tags
 
-Consolidates tags across all summaries for consistency.
+Consolidates tags across all summaries for consistency using a 3-step workflow.
+
+#### Step 4.1: Generate Normalization Prompt
 
 ```bash
-./krisp-sync --step normalize
+./krisp-sync --step normalize-prompt
 ```
 
 - Analyzes all tags used across meetings
-- Uses Gemini AI to merge synonyms and standardize formats
-- Updates all cached summaries with canonical tags
-- Saves tag dictionary to `tags-dictionary.json`
+- Performs fuzzy matching to pre-consolidate obvious duplicates
+- Generates a prompt file for LLM processing
+- Outputs:
+  - `normalize-prompt-generated.txt` - Prompt to send to your LLM
+  - `normalize-premappings.json` - Pre-consolidated tag mappings
+
+#### Step 4.2: Process with LLM (Manual)
+
+Run your preferred LLM (e.g., Claude, Gemini) on the generated prompt. The LLM will consolidate semantically related tags. Save the result to `llm-result.json` in this format:
+
+```json
+[
+  {
+    "canonical_tag": "product-strategy",
+    "old_tags": ["product-strategy", "product-roadmap", "product-vision", ...]
+  },
+  ...
+]
+```
+
+#### Step 4.3: Consume LLM Result
+
+```bash
+./krisp-sync --step normalize-consume
+```
+
+- Reads `llm-result.json` and `normalize-premappings.json`
+- Merges LLM mappings with fuzzy pre-mappings
+- Creates `tags-proposal.json` for review
+
+#### Step 4.4: Apply Normalization
+
+```bash
+./krisp-sync --step normalize-apply
+```
+
+- Reads `tags-proposal.json`
+- Writes `tags-dictionary.json`
+- Tag mappings are applied when syncing to Obsidian (summaries remain unchanged)
 - Future summaries will prefer existing canonical tags
 
 ## Common Workflows
@@ -181,7 +227,10 @@ Consolidates tags across all summaries for consistency.
 ./krisp-sync --step summarize --limit 0
 
 # Normalize tags before syncing
-./krisp-sync --step normalize
+./krisp-sync --step normalize-prompt
+# (Process prompt with LLM, save to llm-result.json)
+./krisp-sync --step normalize-consume
+./krisp-sync --step normalize-apply
 
 # Sync to Obsidian
 ./krisp-sync --step sync --limit 0
@@ -216,6 +265,16 @@ rm meetings/*-summary.json
 ./krisp-sync --step summarize --resummarize --limit 0
 ```
 
+### Re-summarize and re-sync a single meeting
+
+```bash
+# Re-summarize a specific meeting that had issues
+./krisp-sync --step summarize --meeting fd00fb02629c46d0981c968a5565ecc6 --resummarize
+
+# Re-sync a specific meeting to Obsidian
+./krisp-sync --step sync --meeting fd00fb02629c46d0981c968a5565ecc6 --resync
+```
+
 ### Test workflow with single meeting
 
 ```bash
@@ -229,8 +288,12 @@ rm meetings/*-summary.json
 ### Fix tag inconsistencies
 
 ```bash
-# Re-run normalization
-./krisp-sync --step normalize
+# Re-run normalization workflow
+./krisp-sync --step normalize-prompt
+# (Process prompt with LLM, save to llm-result.json)
+./krisp-sync --step normalize-consume
+# (Review tags-proposal.json)
+./krisp-sync --step normalize-apply
 
 # Re-sync summaries with updated tags
 ./krisp-sync --step sync --resync --limit 0
