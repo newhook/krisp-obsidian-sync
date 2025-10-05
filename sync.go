@@ -26,18 +26,26 @@ type MeetingWithSummary struct {
 }
 
 // Stage 3: Sync cached meetings and summaries to Obsidian
-func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, overwrite bool, testMode bool, applyNormalization bool, meetingID string, cache *Cache) error {
+func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, overwrite bool, testMode bool, applyNormalization bool, meetingIDs []string, cache *Cache) error {
 	fmt.Println("\n=== Stage 3: Syncing to Obsidian ===")
 
-	// Handle single meeting mode
-	if meetingID != "" {
-		fmt.Printf("🎯 Single meeting mode: %s\n", meetingID)
+	// Handle specific meeting IDs mode
+	if len(meetingIDs) > 0 {
+		fmt.Printf("🎯 Processing %d specific meeting(s)\n", len(meetingIDs))
 		if overwrite {
-			fmt.Println("🔄 Forcing re-sync of this meeting")
-			delete(syncState.ObsidianSyncedMeetings, meetingID)
+			fmt.Println("🔄 Forcing re-sync of specified meetings")
+			for _, id := range meetingIDs {
+				delete(syncState.ObsidianSyncedMeetings, id)
+			}
 		}
-		// Process only this meeting
-		return syncSingleMeeting(ctx, meetingID, obsidianVaultPath, syncState, applyNormalization, cache)
+		// Process each meeting
+		for _, meetingID := range meetingIDs {
+			if err := syncSingleMeeting(ctx, meetingID, obsidianVaultPath, syncState, applyNormalization, cache); err != nil {
+				fmt.Printf("❌ Error syncing meeting %s: %v\n", meetingID, err)
+				// Continue with other meetings
+			}
+		}
+		return nil
 	}
 
 	return runSyncInternal(ctx, obsidianVaultPath, limit, syncState, overwrite, testMode, applyNormalization, cache)

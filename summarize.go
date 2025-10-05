@@ -18,18 +18,159 @@ import (
 var summaryPromptTemplate string
 
 // Stage 2: Summarize cached meetings with Gemini
-func runSummarize(ctx context.Context, limit int, syncState *SyncState, overwrite bool, meetingID string, cache *Cache) error {
+func runSummarize(ctx context.Context, limit int, syncState *SyncState, overwrite bool, meetingIDs []string, cache *Cache) error {
 	fmt.Println("\n=== Stage 2: Summarizing meetings ===")
 
-	// Handle single meeting mode
-	if meetingID != "" {
-		fmt.Printf("🎯 Single meeting mode: %s\n", meetingID)
+	// Handle specific meeting IDs mode
+	if len(meetingIDs) > 0 {
+		fmt.Printf("🎯 Processing %d specific meeting(s)\n", len(meetingIDs))
 		if overwrite {
-			fmt.Println("🔄 Forcing re-summarization of this meeting")
-			delete(syncState.SummarizedMeetings, meetingID)
+			fmt.Println("🔄 Forcing re-summarization of specified meetings")
+			for _, id := range meetingIDs {
+				delete(syncState.SummarizedMeetings, id)
+			}
 		}
-		// Process only this meeting
-		return summarizeSingleMeeting(ctx, meetingID, syncState, cache)
+
+		// Load tags from Obsidian vault once
+		var existingTags []string
+		obsidianTags, err := loadObsidianTags()
+		if err != nil {
+			fmt.Printf("⚠ Warning: Error loading obsidian-tags.json: %v\n", err)
+		} else if obsidianTags != nil && len(obsidianTags) > 0 {
+			existingTags = obsidianTags
+			fmt.Printf("📚 Loaded %d tags from Obsidian vault\n", len(existingTags))
+		}
+
+		// Load all meetings and their transcripts
+		type meetingWithTranscript struct {
+			ID         string
+			Transcript string
+		}
+		var meetingsToProcess []meetingWithTranscript
+
+		for _, meetingID := range meetingIDs {
+			meeting, err := cache.LoadMeeting(meetingID)
+			if err != nil {
+				fmt.Printf("⚠ Error loading meeting %s: %v\n", meetingID, err)
+				continue
+			}
+
+			// Parse transcript
+			if meeting.Resources.Transcript.Status != "uploaded" {
+				fmt.Printf("⚠ Transcript not uploaded for %s (status: %s)\n", meetingID, meeting.Resources.Transcript.Status)
+				continue
+			}
+			if meeting.Resources.Transcript.Content == "" {
+				fmt.Printf("⚠ Transcript content empty for %s\n", meetingID)
+				continue
+			}
+
+			var segments []Segment
+			if err := json.Unmarshal([]byte(meeting.Resources.Transcript.Content), &segments); err != nil {
+				fmt.Printf("⚠ Error parsing transcript JSON for %s: %v\n", meetingID, err)
+				continue
+			}
+
+			if len(segments) == 0 {
+				fmt.Printf("⚠ Transcript has no segments for %s\n", meetingID)
+				continue
+			}
+
+			var sb strings.Builder
+			for _, seg := range segments {
+				speakerName := fmt.Sprintf("Speaker %d", seg.SpeakerIndex)
+				if speakerInfo, ok := meeting.Speakers.Data[fmt.Sprintf("%d", seg.SpeakerIndex)]; ok {
+					speakerName = strings.TrimSpace(speakerInfo.Person.FirstName + " " + speakerInfo.Person.LastName)
+					if speakerName == "" {
+						speakerName = fmt.Sprintf("Speaker %d", seg.SpeakerIndex)
+					}
+				}
+				sb.WriteString(fmt.Sprintf("%s: %s\n", speakerName, seg.Speech.Text))
+			}
+			transcriptText := sb.String()
+
+			if transcriptText == "" {
+				fmt.Printf("⚠ Generated transcript text is empty for %s\n", meetingID)
+				continue
+			}
+
+			meetingsToProcess = append(meetingsToProcess, meetingWithTranscript{
+				ID:         meetingID,
+				Transcript: transcriptText,
+			})
+		}
+
+		if len(meetingsToProcess) == 0 {
+			fmt.Println("⚠ No meetings with transcripts to process")
+			return nil
+		}
+
+		// Process summaries in parallel with concurrency limit
+		const maxConcurrency = 10
+		semaphore := make(chan struct{}, maxConcurrency)
+
+		type result struct {
+			index int
+			id    string
+			data  *SummaryData
+			err   error
+		}
+		results := make(chan result, len(meetingsToProcess))
+
+		// Process each meeting in parallel
+		for i, m := range meetingsToProcess {
+			// Check if context was cancelled
+			if ctx.Err() != nil {
+				fmt.Printf("\n⚠ Summarization cancelled\n")
+				return ctx.Err()
+			}
+
+			semaphore <- struct{}{} // Acquire semaphore
+
+			go func(index int, meetingID string, transcript string) {
+				defer func() { <-semaphore }() // Release semaphore
+
+				fmt.Printf("[%d/%d] Summarizing meeting: %s\n", index+1, len(meetingsToProcess), meetingID)
+
+				// Generate summary with Gemini
+				summaryResponse, err := summarizeWithGemini(ctx, transcript, existingTags)
+				if err != nil {
+					fmt.Printf("  ⚠ Error generating summary: %v\n", err)
+					results <- result{index: index, id: meetingID, err: err}
+					return
+				}
+
+				// Parse the summary response to SummaryData
+				summaryData := parseSummaryResponse(summaryResponse)
+
+				fmt.Printf("  ✓ Summary generated: %s\n", meetingID)
+				results <- result{index: index, id: meetingID, data: summaryData, err: nil}
+			}(i, m.ID, m.Transcript)
+		}
+
+		// Wait for all goroutines to complete and save results
+		successCount := 0
+		for i := 0; i < len(meetingsToProcess); i++ {
+			res := <-results
+			if res.err == nil {
+				// Save summary to cache
+				if err := cache.SaveSummary(res.id, res.data); err != nil {
+					fmt.Printf("  ⚠ Error saving summary for %s: %v\n", res.id, err)
+					continue
+				}
+				fmt.Printf("  ✓ Summary saved: meetings/%s-summary.json\n", res.id)
+
+				syncState.SummarizedMeetings[res.id] = true
+				successCount++
+				// Save state after each successful summary
+				if err := syncState.Save(); err != nil {
+					fmt.Printf("  ⚠ Warning: Could not save sync state: %v\n", err)
+				}
+			}
+		}
+
+		fmt.Printf("\n✅ Summarized %d meeting(s)\n", successCount)
+		return nil
 	}
 
 	if overwrite {

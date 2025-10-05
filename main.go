@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,8 +34,17 @@ func main() {
 	overwriteFlag := flag.Bool("overwrite", false, "Force re-process meetings, ignoring state (re-summarize and re-sync)")
 	testFlag := flag.Bool("test", false, "Test mode: create a single test file without updating state (sync stage only)")
 	applyNormalizationFlag := flag.Bool("apply-normalization", false, "Apply tag normalization from normalize-result.json during sync (for initial mass import)")
-	meetingIDFlag := flag.String("meeting", "", "Process a specific meeting ID (combine with --overwrite to re-process)")
+	meetingIDFlag := flag.String("meeting", "", "Process specific meeting IDs (comma-separated, combine with --overwrite to re-process)")
 	flag.Parse()
+
+	// Parse meeting IDs if provided
+	var meetingIDs []string
+	if *meetingIDFlag != "" {
+		meetingIDs = strings.Split(*meetingIDFlag, ",")
+		for i := range meetingIDs {
+			meetingIDs[i] = strings.TrimSpace(meetingIDs[i])
+		}
+	}
 
 	// Load environment variables from .env file
 	if err := godotenv.Load(); err != nil {
@@ -103,7 +113,7 @@ func main() {
 
 	// Stage 2: Summarize
 	if runAll || step == "summarize" {
-		if err := runSummarize(ctx, *limitFlag, syncState, *overwriteFlag, *meetingIDFlag, cache); err != nil {
+		if err := runSummarize(ctx, *limitFlag, syncState, *overwriteFlag, meetingIDs, cache); err != nil {
 			fmt.Printf("❌ Error in summarize stage: %v\n", err)
 			return
 		}
@@ -111,7 +121,7 @@ func main() {
 
 	// Stage 3: Sync
 	if runAll || step == "sync" {
-		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *overwriteFlag, *testFlag, *applyNormalizationFlag, *meetingIDFlag, cache); err != nil {
+		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *overwriteFlag, *testFlag, *applyNormalizationFlag, meetingIDs, cache); err != nil {
 			fmt.Printf("❌ Error in sync stage: %v\n", err)
 			return
 		}

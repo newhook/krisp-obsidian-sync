@@ -44,8 +44,8 @@ func extractTagsFromObsidian(vaultPath string) (map[string]int, error) {
 			return nil
 		}
 
-		// Skip our own generated meeting files to avoid polluting the tag list
-		if strings.Contains(path, "/meetings/") {
+		// Skip transcript files (they don't have frontmatter tags)
+		if strings.HasSuffix(info.Name(), "-transcript.md") {
 			return nil
 		}
 

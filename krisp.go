@@ -79,7 +79,7 @@ type Speech struct {
 func fetchAllMeetings(ctx context.Context) ([]MeetingSummary, error) {
 	var allMeetings []MeetingSummary
 	page := 1
-	limit := 20
+	limit := 100
 
 	for {
 		// Check if context was cancelled
@@ -126,10 +126,6 @@ func fetchAllMeetings(ctx context.Context) ([]MeetingSummary, error) {
 		}
 
 		allMeetings = append(allMeetings, listResp.Data.Rows...)
-
-		// Debug output
-		fmt.Printf("DEBUG: Page %d - Got %d meetings, Total in response: %d, Accumulated: %d\n",
-			page, len(listResp.Data.Rows), listResp.Data.Total, len(allMeetings))
 
 		// Continue if we got a full page of results
 		if len(listResp.Data.Rows) < limit {
