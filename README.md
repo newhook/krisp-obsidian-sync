@@ -19,9 +19,9 @@ A tool to sync meeting recordings from Krisp.ai to your Obsidian vault with AI-g
 ## Prerequisites
 
 1. **Krisp.ai account** with API access
-2. **Google Cloud project** with Vertex AI enabled
+2. **Google Cloud project** with Vertex AI API enabled
 3. **Obsidian vault** (local directory)
-4. **Go 1.21+** installed
+4. **Go 1.24.2+** installed
 
 ## Setup
 
@@ -31,15 +31,10 @@ A tool to sync meeting recordings from Krisp.ai to your Obsidian vault with AI-g
 KRISP_BEARER_TOKEN=your_krisp_api_token
 GOOGLE_CLOUD_PROJECT=your-gcp-project-id
 GOOGLE_CLOUD_LOCATION=us-central1
+OBSIDIAN_VAULT_PATH=/path/to/your/Obsidian Vault
 ```
 
-2. Update the Obsidian vault path in `main.go`:
-
-```go
-obsidianVaultPath := "/path/to/your/Obsidian Vault"
-```
-
-3. Build the project:
+2. Build the project:
 
 ```bash
 go build -o krisp-sync .
@@ -56,28 +51,24 @@ go build -o krisp-sync .
 ### Flags
 
 - `--step <stage>` - Run a specific stage (default: `all`)
-  - `all` - Run all stages in sequence
+  - `all` - Run all stages in sequence (extract-tags, download, summarize, sync)
   - `download` - Download meetings from Krisp API to local cache
   - `summarize` - Generate AI summaries for cached meetings
   - `sync` - Sync cached meetings and summaries to Obsidian
-  - `normalize-prompt` - Generate tag normalization prompt
-  - `normalize-consume` - Consume LLM result and create proposal
-  - `normalize-apply` - Apply normalization proposal and write tags dictionary
+  - `extract-tags` - Extract all existing tags from Obsidian vault to obsidian-tags.json
+  - `normalize-prompt` - Generate tag normalization prompt for initial mass import
   - `repair` - Sync filesystem state with tracking state
 
 - `--limit <n>` - Number of meetings to process (default: `1` for testing)
   - Set to `0` to process all available meetings
   - Useful for testing with small batches first
 
-- `--resync` - Force re-sync all meetings to Obsidian, ignoring sync state
-  - Clears the Obsidian sync tracking
-  - Does not re-download or re-summarize
-  - Useful if you've modified your Obsidian templates
-
-- `--resummarize` - Force re-summarize all meetings, ignoring summarization state
-  - Clears the summarization tracking
-  - Does not re-download meetings
-  - Useful if you've modified your summary prompt or want to regenerate summaries
+- `--overwrite` - Force re-process meetings, ignoring state
+  - When used alone: Re-processes ALL meetings (clears all state)
+  - When used with `--meeting`: Re-processes only that specific meeting
+  - Re-summarizes meetings (ignoring summarization state)
+  - Re-syncs meetings to Obsidian (ignoring sync state)
+  - Useful if you've modified templates or prompts
 
 - `--test` - Test mode for sync stage only
   - Creates a single test file without updating state
@@ -86,9 +77,13 @@ go build -o krisp-sync .
   - Does not mark meetings as synced
 
 - `--meeting <meeting-id>` - Process a specific meeting by ID
-  - Works with `--resummarize` to re-summarize a single meeting
-  - Works with `--resync` to re-sync a single meeting to Obsidian
+  - Combine with `--overwrite` to re-summarize and re-sync a single meeting
   - Useful for fixing issues with individual meetings
+
+- `--apply-normalization` - Apply tag normalization during sync (for initial mass import only)
+  - Loads `normalize-result.json` and `normalize-premappings.json`
+  - Applies tag mappings when writing to Obsidian
+  - Use only during initial mass import, not for daily incremental syncs
 
 ## How It Works
 
@@ -114,9 +109,10 @@ Generates AI summaries using Google Gemini for each cached meeting.
 ```
 
 - Processes meetings in chronological order (oldest to newest)
+- Automatically loads existing tags from Obsidian vault (obsidian-tags.json) to guide tag suggestions
 - Uses meeting transcripts to generate:
-  - One-line description
-  - Relevant tags (using existing tag dictionary if available)
+  - One-line description (max 10 words)
+  - Relevant tags (preferring existing Obsidian tags when appropriate)
   - List of topics discussed
   - Detailed summaries for each topic
 - Saves summaries to `meetings/<meeting-id>-summary.json`
@@ -163,58 +159,6 @@ SORT time ASC
 - Skips existing files (never overwrites)
 - Tracks synced meetings in state file
 
-### Stage 4: Normalize Tags
-
-Consolidates tags across all summaries for consistency using a 3-step workflow.
-
-#### Step 4.1: Generate Normalization Prompt
-
-```bash
-./krisp-sync --step normalize-prompt
-```
-
-- Analyzes all tags used across meetings
-- Performs fuzzy matching to pre-consolidate obvious duplicates
-- Generates a prompt file for LLM processing
-- Outputs:
-  - `normalize-prompt-generated.txt` - Prompt to send to your LLM
-  - `normalize-premappings.json` - Pre-consolidated tag mappings
-
-#### Step 4.2: Process with LLM (Manual)
-
-Run your preferred LLM (e.g., Claude, Gemini) on the generated prompt. The LLM will consolidate semantically related tags. Save the result to `llm-result.json` in this format:
-
-```json
-[
-  {
-    "canonical_tag": "product-strategy",
-    "old_tags": ["product-strategy", "product-roadmap", "product-vision", ...]
-  },
-  ...
-]
-```
-
-#### Step 4.3: Consume LLM Result
-
-```bash
-./krisp-sync --step normalize-consume
-```
-
-- Reads `llm-result.json` and `normalize-premappings.json`
-- Merges LLM mappings with fuzzy pre-mappings
-- Creates `tags-proposal.json` for review
-
-#### Step 4.4: Apply Normalization
-
-```bash
-./krisp-sync --step normalize-apply
-```
-
-- Reads `tags-proposal.json`
-- Writes `tags-dictionary.json`
-- Tag mappings are applied when syncing to Obsidian (summaries remain unchanged)
-- Future summaries will prefer existing canonical tags
-
 ## Common Workflows
 
 ### First-time sync of all meetings
@@ -226,22 +170,25 @@ Run your preferred LLM (e.g., Claude, Gemini) on the generated prompt. The LLM w
 # Summarize all meetings
 ./krisp-sync --step summarize --limit 0
 
-# Normalize tags before syncing
-./krisp-sync --step normalize-prompt
-# (Process prompt with LLM, save to llm-result.json)
-./krisp-sync --step normalize-consume
-./krisp-sync --step normalize-apply
-
 # Sync to Obsidian
 ./krisp-sync --step sync --limit 0
 ```
+
+After the first sync, you may want to normalize tags (see below).
 
 ### Incremental sync (daily use)
 
 ```bash
 # Run all stages for new meetings only
+# This automatically extracts Obsidian tags for AI summarization
 ./krisp-sync --limit 0
 ```
+
+This workflow:
+1. Extracts tags from your Obsidian vault (obsidian-tags.json)
+2. Downloads new meetings from Krisp
+3. Generates AI summaries using existing Obsidian tags
+4. Syncs to Obsidian vault
 
 ### Testing with small batches
 
@@ -253,26 +200,24 @@ Run your preferred LLM (e.g., Claude, Gemini) on the generated prompt. The LLM w
 ### Re-sync to Obsidian after template changes
 
 ```bash
-# Delete meeting files from vault, then:
-./krisp-sync --step sync --resync --limit 0
+./krisp-sync --step sync --overwrite --limit 0
 ```
 
 ### Re-generate summaries after prompt changes
 
 ```bash
-# Clear cached summaries, then:
-rm meetings/*-summary.json
-./krisp-sync --step summarize --resummarize --limit 0
+./krisp-sync --step summarize --overwrite --limit 0
 ```
 
-### Re-summarize and re-sync a single meeting
+### Re-process a single meeting that had issues
 
 ```bash
-# Re-summarize a specific meeting that had issues
-./krisp-sync --step summarize --meeting fd00fb02629c46d0981c968a5565ecc6 --resummarize
+# Re-summarize AND re-sync a specific meeting
+./krisp-sync --meeting fd00fb02629c46d0981c968a5565ecc6 --overwrite
 
-# Re-sync a specific meeting to Obsidian
-./krisp-sync --step sync --meeting fd00fb02629c46d0981c968a5565ecc6 --resync
+# Or run specific stages separately
+./krisp-sync --step summarize --meeting fd00fb02629c46d0981c968a5565ecc6 --overwrite
+./krisp-sync --step sync --meeting fd00fb02629c46d0981c968a5565ecc6 --overwrite
 ```
 
 ### Test workflow with single meeting
@@ -285,19 +230,58 @@ rm meetings/*-summary.json
 ./krisp-sync --step sync --test
 ```
 
-### Fix tag inconsistencies
+### Tag normalization for initial mass import (optional)
+
+If you've already imported many meetings before starting to use krisp-sync, you may want to consolidate similar tags for consistency. This is a **one-time workflow** for initial mass imports only. Daily incremental syncs automatically use your existing Obsidian tags.
+
+#### Step 1: Generate normalization prompt
 
 ```bash
-# Re-run normalization workflow
 ./krisp-sync --step normalize-prompt
-# (Process prompt with LLM, save to llm-result.json)
-./krisp-sync --step normalize-consume
-# (Review tags-proposal.json)
-./krisp-sync --step normalize-apply
-
-# Re-sync summaries with updated tags
-./krisp-sync --step sync --resync --limit 0
 ```
+
+This analyzes all meeting summaries and:
+- Performs fuzzy matching to pre-consolidate obvious duplicates (e.g., "product-roadmap" and "product-road-map")
+- Generates `normalize-prompt-generated.txt` - a prompt to send to your LLM
+- Generates `normalize-premappings.json` - fuzzy pre-consolidated tag mappings
+
+#### Step 2: Process with your LLM (manual)
+
+1. Copy the contents of `normalize-prompt-generated.txt`
+2. Send it to your preferred LLM (Claude, Gemini, GPT-4, etc.)
+3. The LLM will consolidate semantically related tags (e.g., "product-strategy", "product-roadmap", "product-vision" → "product-strategy")
+4. Save the LLM's JSON response to `normalize-result.json` in this format:
+
+```json
+[
+  {
+    "canonical_tag": "product-strategy",
+    "old_tags": ["product-strategy", "product-roadmap", "product-vision"]
+  },
+  {
+    "canonical_tag": "engineering",
+    "old_tags": ["engineering", "technical-discussion", "architecture"]
+  }
+]
+```
+
+#### Step 3: Re-sync meetings with normalized tags
+
+```bash
+./krisp-sync --step sync --apply-normalization --overwrite --limit 0
+```
+
+This will:
+- Load `normalize-result.json` and `normalize-premappings.json`
+- Merge the mappings (premappings → LLM mappings)
+- Apply tag consolidation when writing to Obsidian
+- Overwrite all meeting files with normalized tags
+
+**Note**: Meeting summary JSON files remain unchanged - normalization is applied only when writing to Obsidian.
+
+#### Future syncs
+
+After the initial import, **do not use `--apply-normalization`** for daily incremental syncs. The default workflow automatically uses tags from your Obsidian vault to guide AI summarization, ensuring consistency without manual normalization.
 
 ## State File
 
@@ -321,14 +305,6 @@ Templates are embedded in the source code:
 - `normalize-prompt.md` - Prompt for tag normalization
 
 Edit these files and rebuild to customize output.
-
-### Obsidian Vault Path
-
-Edit `main.go` to change the vault location:
-
-```go
-obsidianVaultPath := "/Users/yourname/Documents/Obsidian Vault"
-```
 
 ## Troubleshooting
 
@@ -376,9 +352,12 @@ go build -o krisp-sync .
 
 ### Dependencies
 
-- `github.com/joho/godotenv` - Environment variable loading
-- `google.golang.org/genai` - Google Gemini AI client
+- `github.com/joho/godotenv` - Environment variable loading from .env files
+- `github.com/lithammer/fuzzysearch` - Fuzzy string matching for tag pre-consolidation
+- `github.com/yuin/goldmark` - Markdown parser for extracting tags from Obsidian notes
+- `google.golang.org/genai` - Google Gemini AI client (Vertex AI)
+- `gopkg.in/yaml.v3` - YAML parser for Obsidian frontmatter
 
 ## License
 
-Private project - not for distribution.
+MIT License - see [LICENSE](LICENSE) file for details.

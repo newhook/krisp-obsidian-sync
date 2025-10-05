@@ -29,12 +29,11 @@ var (
 func main() {
 	// Parse command-line flags
 	limitFlag := flag.Int("limit", 1, "Number of meetings to process (default: 1 for testing)")
-	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, normalize, normalize-prompt, normalize-consume, normalize-apply, repair, or all (default: all)")
-	resyncFlag := flag.Bool("resync", false, "Force re-sync all meetings to Obsidian, ignoring sync state")
-	resummarizeFlag := flag.Bool("resummarize", false, "Force re-summarize all meetings, ignoring summarization state")
+	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, normalize-prompt, extract-tags, repair, or all (default: all)")
+	overwriteFlag := flag.Bool("overwrite", false, "Force re-process meetings, ignoring state (re-summarize and re-sync)")
 	testFlag := flag.Bool("test", false, "Test mode: create a single test file without updating state (sync stage only)")
-	applyFlag := flag.Bool("apply", false, "Apply normalization proposal (normalize stage only)")
-	meetingIDFlag := flag.String("meeting", "", "Process a specific meeting ID (for resummarize/resync single meeting)")
+	applyNormalizationFlag := flag.Bool("apply-normalization", false, "Apply tag normalization from normalize-result.json during sync (for initial mass import)")
+	meetingIDFlag := flag.String("meeting", "", "Process a specific meeting ID (combine with --overwrite to re-process)")
 	flag.Parse()
 
 	// Load environment variables from .env file
@@ -57,8 +56,10 @@ func main() {
 		log.Fatal("GOOGLE_CLOUD_LOCATION not set in .env file")
 	}
 
-	// Configuration
-	obsidianVaultPath := "/Users/matthew/Documents/Obsidian Vault"
+	obsidianVaultPath := os.Getenv("OBSIDIAN_VAULT_PATH")
+	if obsidianVaultPath == "" {
+		log.Fatal("OBSIDIAN_VAULT_PATH not set in .env file")
+	}
 
 	// Store sync state in application directory
 	syncStatePath := filepath.Join(".", syncStateFile)
@@ -84,6 +85,14 @@ func main() {
 	step := *stepFlag
 	runAll := step == "all"
 
+	// Stage 0: Extract tags from Obsidian (runs automatically in "all" workflow)
+	if runAll {
+		if err := runExtractTags(obsidianVaultPath); err != nil {
+			fmt.Printf("❌ Error extracting tags: %v\n", err)
+			return
+		}
+	}
+
 	// Stage 1: Download
 	if runAll || step == "download" {
 		if err := runDownload(ctx, *limitFlag, syncState, cache); err != nil {
@@ -94,7 +103,7 @@ func main() {
 
 	// Stage 2: Summarize
 	if runAll || step == "summarize" {
-		if err := runSummarize(ctx, *limitFlag, syncState, *resummarizeFlag, *meetingIDFlag, cache); err != nil {
+		if err := runSummarize(ctx, *limitFlag, syncState, *overwriteFlag, *meetingIDFlag, cache); err != nil {
 			fmt.Printf("❌ Error in summarize stage: %v\n", err)
 			return
 		}
@@ -102,33 +111,25 @@ func main() {
 
 	// Stage 3: Sync
 	if runAll || step == "sync" {
-		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *resyncFlag, *testFlag, *meetingIDFlag, cache); err != nil {
+		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *overwriteFlag, *testFlag, *applyNormalizationFlag, *meetingIDFlag, cache); err != nil {
 			fmt.Printf("❌ Error in sync stage: %v\n", err)
 			return
 		}
 	}
 
-	// Stage 4: Normalize tags (3 sub-steps)
+	// Stage 4: Normalize tags (manual workflow for initial mass import)
 	if step == "normalize-prompt" {
-		// Step 1: Generate prompt
+		// Generate normalization prompt from existing meeting summaries
 		if err := runNormalizePrompt(ctx, cache); err != nil {
 			fmt.Printf("❌ Error generating normalization prompt: %v\n", err)
 			return
 		}
 	}
 
-	if step == "normalize-consume" {
-		// Step 2: Consume LLM result
-		if err := runNormalizeConsume(ctx, cache); err != nil {
-			fmt.Printf("❌ Error consuming LLM result: %v\n", err)
-			return
-		}
-	}
-
-	if step == "normalize-apply" || *applyFlag {
-		// Step 3: Apply proposal
-		if err := runNormalizeApply(ctx, cache); err != nil {
-			fmt.Printf("❌ Error applying normalization: %v\n", err)
+	// Extract tags from Obsidian vault
+	if step == "extract-tags" {
+		if err := runExtractTags(obsidianVaultPath); err != nil {
+			fmt.Printf("❌ Error extracting tags: %v\n", err)
 			return
 		}
 	}

@@ -18,13 +18,13 @@ import (
 var summaryPromptTemplate string
 
 // Stage 2: Summarize cached meetings with Gemini
-func runSummarize(ctx context.Context, limit int, syncState *SyncState, resummarize bool, meetingID string, cache *Cache) error {
+func runSummarize(ctx context.Context, limit int, syncState *SyncState, overwrite bool, meetingID string, cache *Cache) error {
 	fmt.Println("\n=== Stage 2: Summarizing meetings ===")
 
 	// Handle single meeting mode
 	if meetingID != "" {
 		fmt.Printf("🎯 Single meeting mode: %s\n", meetingID)
-		if resummarize {
+		if overwrite {
 			fmt.Println("🔄 Forcing re-summarization of this meeting")
 			delete(syncState.SummarizedMeetings, meetingID)
 		}
@@ -32,19 +32,22 @@ func runSummarize(ctx context.Context, limit int, syncState *SyncState, resummar
 		return summarizeSingleMeeting(ctx, meetingID, syncState, cache)
 	}
 
-	if resummarize {
-		fmt.Println("🔄 Resummarize mode: clearing summarization state")
+	if overwrite {
+		fmt.Println("🔄 Overwrite mode: clearing summarization state")
 		syncState.SummarizedMeetings = make(map[string]bool)
 	}
 
-	// Load tags dictionary if it exists
-	dict, err := loadTagsDictionary()
+	// Load tags from Obsidian vault if available
 	var existingTags []string
-	if err == nil && dict != nil {
-		existingTags = dict.CanonicalTags
-		fmt.Printf("📚 Loaded %d canonical tags from dictionary\n", len(existingTags))
+	obsidianTags, err := loadObsidianTags()
+	if err != nil {
+		fmt.Printf("⚠ Warning: Error loading obsidian-tags.json: %v\n", err)
+	} else if obsidianTags != nil && len(obsidianTags) > 0 {
+		existingTags = obsidianTags
+		fmt.Printf("📚 Loaded %d tags from Obsidian vault\n", len(existingTags))
 	} else {
-		fmt.Println("📝 No tags dictionary found - tags will be generated freely")
+		fmt.Println("📝 No Obsidian tags found - tags will be generated freely")
+		fmt.Println("   Tip: Run --step extract-tags first to use existing vault tags")
 	}
 
 	// Get meetings from sync state that need summarization
@@ -371,12 +374,14 @@ func parseSummaryResponse(response string) *SummaryData {
 
 // summarizeSingleMeeting summarizes a single meeting by ID
 func summarizeSingleMeeting(ctx context.Context, meetingID string, syncState *SyncState, cache *Cache) error {
-	// Load tags dictionary if it exists
-	dict, err := loadTagsDictionary()
+	// Load tags from Obsidian vault if available
 	var existingTags []string
-	if err == nil && dict != nil {
-		existingTags = dict.CanonicalTags
-		fmt.Printf("📚 Loaded %d canonical tags from dictionary\n", len(existingTags))
+	obsidianTags, err := loadObsidianTags()
+	if err != nil {
+		fmt.Printf("⚠ Warning: Error loading obsidian-tags.json: %v\n", err)
+	} else if obsidianTags != nil && len(obsidianTags) > 0 {
+		existingTags = obsidianTags
+		fmt.Printf("📚 Loaded %d tags from Obsidian vault\n", len(existingTags))
 	}
 
 	// Load the meeting

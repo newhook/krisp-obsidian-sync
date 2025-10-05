@@ -26,21 +26,21 @@ type MeetingWithSummary struct {
 }
 
 // Stage 3: Sync cached meetings and summaries to Obsidian
-func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, resync bool, testMode bool, meetingID string, cache *Cache) error {
+func runSync(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, overwrite bool, testMode bool, applyNormalization bool, meetingID string, cache *Cache) error {
 	fmt.Println("\n=== Stage 3: Syncing to Obsidian ===")
 
 	// Handle single meeting mode
 	if meetingID != "" {
 		fmt.Printf("🎯 Single meeting mode: %s\n", meetingID)
-		if resync {
+		if overwrite {
 			fmt.Println("🔄 Forcing re-sync of this meeting")
 			delete(syncState.ObsidianSyncedMeetings, meetingID)
 		}
 		// Process only this meeting
-		return syncSingleMeeting(ctx, meetingID, obsidianVaultPath, syncState, cache)
+		return syncSingleMeeting(ctx, meetingID, obsidianVaultPath, syncState, applyNormalization, cache)
 	}
 
-	return runSyncInternal(ctx, obsidianVaultPath, limit, syncState, resync, testMode, meetingID, cache)
+	return runSyncInternal(ctx, obsidianVaultPath, limit, syncState, overwrite, testMode, applyNormalization, cache)
 }
 
 // fileExists checks if a file exists
@@ -98,7 +98,7 @@ func generateTranscriptContent(m *Meeting) string {
 }
 
 // syncSingleMeeting syncs a single meeting by ID to Obsidian
-func syncSingleMeeting(ctx context.Context, meetingID string, obsidianVaultPath string, syncState *SyncState, cache *Cache) error {
+func syncSingleMeeting(ctx context.Context, meetingID string, obsidianVaultPath string, syncState *SyncState, applyNormalization bool, cache *Cache) error {
 	// Temporarily add meeting to synced list if not there
 	if !syncState.SyncedMeetings[meetingID] {
 		return fmt.Errorf("meeting %s not found in sync state (run download first)", meetingID)
@@ -114,7 +114,7 @@ func syncSingleMeeting(ctx context.Context, meetingID string, obsidianVaultPath 
 	}
 
 	// Run the sync with limit 1 and test mode true to force overwrite
-	if err := runSyncInternal(ctx, obsidianVaultPath, 1, tempState, false, true, "", cache); err != nil {
+	if err := runSyncInternal(ctx, obsidianVaultPath, 1, tempState, false, true, applyNormalization, cache); err != nil {
 		return err
 	}
 
@@ -128,31 +128,53 @@ func syncSingleMeeting(ctx context.Context, meetingID string, obsidianVaultPath 
 }
 
 // runSyncInternal is the internal sync logic extracted for reuse
-func runSyncInternal(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, resync bool, testMode bool, meetingID string, cache *Cache) error {
+func runSyncInternal(ctx context.Context, obsidianVaultPath string, limit int, syncState *SyncState, overwrite bool, testMode bool, applyNormalization bool, cache *Cache) error {
 	if testMode {
 		fmt.Println("🧪 Test mode: will overwrite files without updating state")
 	}
 
-	// Load tags dictionary if it exists (for applying mappings)
-	tagsDict, err := loadTagsDictionary()
+	// Load normalization mappings if requested (for initial mass import)
 	var tagMappings map[string]string // Reverse lookup: old tag -> canonical tag
-	if err != nil {
-		fmt.Printf("⚠ Warning: Could not load tags dictionary: %v\n", err)
-		fmt.Println("  Tags will be written as-is without normalization")
-	} else if tagsDict != nil {
-		fmt.Printf("📚 Loaded tags dictionary with %d canonical tags\n", len(tagsDict.CanonicalTags))
-		// Build reverse lookup map
-		tagMappings = make(map[string]string)
-		for canonical, oldTags := range tagsDict.Mappings {
-			for _, oldTag := range oldTags {
-				tagMappings[oldTag] = canonical
+	if applyNormalization {
+		fmt.Println("📚 Loading normalization mappings for initial mass import...")
+
+		// Load normalize-result.json (LLM output)
+		normalizeResult, err := loadNormalizeResult()
+		if err != nil {
+			fmt.Printf("⚠ Warning: Could not load normalize-result.json: %v\n", err)
+			fmt.Println("  Tags will be written as-is without normalization")
+		} else {
+			// Load normalize-premappings.json (manual mappings)
+			premappings, err := loadNormalizePremappings()
+			if err != nil {
+				fmt.Printf("⚠ Warning: Could not load normalize-premappings.json: %v\n", err)
+				premappings = &NormalizePremappings{Mappings: make(map[string][]string)}
 			}
+
+			// Merge the mappings
+			tagMappings = make(map[string]string)
+
+			// Apply LLM mappings first
+			for canonical, oldTags := range normalizeResult.Mappings {
+				for _, oldTag := range oldTags {
+					tagMappings[oldTag] = canonical
+				}
+			}
+
+			// Apply premappings (override LLM if conflicts)
+			for canonical, oldTags := range premappings.Mappings {
+				for _, oldTag := range oldTags {
+					tagMappings[oldTag] = canonical
+				}
+			}
+
+			fmt.Printf("📝 Loaded %d tag mappings\n", len(tagMappings))
 		}
 	}
 
-	// If resync flag is set, clear the Obsidian sync state
-	if resync && !testMode {
-		fmt.Println("🔄 Resync mode: clearing Obsidian sync state")
+	// If overwrite flag is set, clear the Obsidian sync state
+	if overwrite && !testMode {
+		fmt.Println("🔄 Overwrite mode: clearing Obsidian sync state")
 		syncState.ObsidianSyncedMeetings = make(map[string]bool)
 	}
 

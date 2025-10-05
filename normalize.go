@@ -11,7 +11,6 @@ import (
 	"sort"
 	"strings"
 	"text/template"
-	"time"
 
 	"github.com/lithammer/fuzzysearch/fuzzy"
 )
@@ -19,21 +18,10 @@ import (
 //go:embed normalize-prompt.md
 var normalizePromptTemplate string
 
-const tagsDictionaryFile = "tags-dictionary.json"
-const tagsProposalFile = "tags-proposal.json"
-
 // tagInfo represents a tag with its occurrence count
 type tagInfo struct {
 	Tag   string
 	Count int
-}
-
-// TagsDictionary holds the canonical tag set and mappings
-type TagsDictionary struct {
-	CanonicalTags  []string            `json:"canonical_tags"`
-	Mappings       map[string][]string `json:"mappings"` // canonical tag -> list of original tags
-	LastNormalized time.Time           `json:"last_normalized"`
-	MeetingCount   int                 `json:"meeting_count"`
 }
 
 // Stage 4.1: Generate normalization prompt
@@ -140,137 +128,7 @@ func runNormalizePrompt(ctx context.Context, cache *Cache) error {
 	fmt.Printf("   - Pre-mappings saved to: normalize-premappings.json\n")
 	fmt.Printf("   - Prompt saved to: normalize-prompt-generated.txt\n")
 	fmt.Printf("   - %d tags to consolidate\n", len(tagList))
-	fmt.Println("\nNext: Run your LLM on the prompt and save result to llm-result.json")
-
-	return nil
-}
-
-// Stage 4.2: Consume LLM result and create proposal
-func runNormalizeConsume(_ context.Context, _ *Cache) error {
-	fmt.Println("\n=== Stage 4.2: Consume LLM Result ===")
-
-	// Load pre-mappings
-	preMappingsData, err := os.ReadFile("normalize-premappings.json")
-	if err != nil {
-		return fmt.Errorf("failed to read normalize-premappings.json: %w (run normalize-prompt first)", err)
-	}
-
-	var preMappingsArray []struct {
-		CanonicalTag string   `json:"canonical_tag"`
-		OldTags      []string `json:"old_tags"`
-	}
-	if err := json.Unmarshal(preMappingsData, &preMappingsArray); err != nil {
-		return fmt.Errorf("failed to parse pre-mappings: %w", err)
-	}
-
-	// Convert to map
-	preMappings := make(map[string][]string)
-	for _, entry := range preMappingsArray {
-		var oldTags []string
-		for _, oldTag := range entry.OldTags {
-			if oldTag != entry.CanonicalTag {
-				oldTags = append(oldTags, oldTag)
-			}
-		}
-		if len(oldTags) > 0 {
-			preMappings[entry.CanonicalTag] = oldTags
-		}
-	}
-
-	// Load LLM result
-	llmResultData, err := os.ReadFile("llm-result.json")
-	if err != nil {
-		return fmt.Errorf("failed to read llm-result.json: %w", err)
-	}
-
-	var llmResult []struct {
-		CanonicalTag string   `json:"canonical_tag"`
-		OldTags      []string `json:"old_tags"`
-	}
-
-	if err := json.Unmarshal(llmResultData, &llmResult); err != nil {
-		return fmt.Errorf("failed to parse llm-result.json: %w", err)
-	}
-
-	// Build canonical tags and mappings
-	var canonicalTags []string
-	llmMappings := make(map[string][]string)
-
-	for _, entry := range llmResult {
-		canonicalTags = append(canonicalTags, entry.CanonicalTag)
-
-		// Filter out the canonical tag itself from old_tags (only keep actual changes)
-		var oldTags []string
-		for _, oldTag := range entry.OldTags {
-			if oldTag != entry.CanonicalTag {
-				oldTags = append(oldTags, oldTag)
-			}
-		}
-		if len(oldTags) > 0 {
-			llmMappings[entry.CanonicalTag] = oldTags
-		}
-	}
-
-	fmt.Printf("✓ LLM returned %d canonical tags with %d mappings\n", len(canonicalTags), len(llmMappings))
-
-	// Merge pre-mappings with LLM mappings
-	finalMappings := make(map[string][]string)
-	for canonical, intermediates := range llmMappings {
-		var allOriginals []string
-		for _, intermediate := range intermediates {
-			// Check if this intermediate was itself consolidated from other tags
-			if originals, ok := preMappings[intermediate]; ok {
-				allOriginals = append(allOriginals, originals...)
-			} else {
-				allOriginals = append(allOriginals, intermediate)
-			}
-		}
-		finalMappings[canonical] = allOriginals
-	}
-
-	// Also include any pre-mappings for tags that weren't further consolidated
-	for canonical, originals := range preMappings {
-		if _, exists := finalMappings[canonical]; !exists {
-			// Check if this canonical tag still exists in the final set
-			stillExists := false
-			for _, tag := range canonicalTags {
-				if tag == canonical {
-					stillExists = true
-					break
-				}
-			}
-			if stillExists {
-				finalMappings[canonical] = originals
-			}
-		}
-	}
-
-	mappings := finalMappings
-
-	// Get meeting count
-	files, err := filepath.Glob(filepath.Join(meetingsCacheDir, "*-summary.json"))
-	if err != nil {
-		return fmt.Errorf("error reading cache directory: %w", err)
-	}
-
-	// Create proposal
-	proposal := &TagsDictionary{
-		CanonicalTags:  canonicalTags,
-		Mappings:       mappings,
-		LastNormalized: time.Now(),
-		MeetingCount:   len(files),
-	}
-
-	// Save proposal
-	if err := saveTagsProposal(proposal); err != nil {
-		return fmt.Errorf("error saving tags proposal: %w", err)
-	}
-
-	fmt.Printf("\n✅ Normalization proposal created!\n")
-	fmt.Printf("   - %d canonical tags\n", len(canonicalTags))
-	fmt.Printf("   - %d mappings\n", len(mappings))
-	fmt.Printf("   - Saved to: %s\n", tagsProposalFile)
-	fmt.Println("\nNext: Review tags-proposal.json, then run: go run . --step normalize-apply")
+	fmt.Println("\nNext: Run your LLM on the prompt and save result to normalize-result.json")
 
 	return nil
 }
@@ -486,93 +344,6 @@ for {
 */
 // END OLD CODE
 
-// Stage 4.3: Apply normalization proposal (write tags dictionary)
-func runNormalizeApply(_ context.Context, _ *Cache) error {
-	fmt.Println("\n=== Applying normalization proposal ===")
-
-	// Load proposal
-	proposal, err := loadTagsProposal()
-	if err != nil {
-		return fmt.Errorf("error loading proposal: %w", err)
-	}
-
-	fmt.Printf("Loaded proposal: %d canonical tags, %d mappings\n", len(proposal.CanonicalTags), len(proposal.Mappings))
-
-	// Display canonical tags
-	fmt.Println("\n📋 Canonical tags:")
-	for _, tag := range proposal.CanonicalTags {
-		fmt.Printf("  - %s\n", tag)
-	}
-
-	// Save as tags dictionary (this will be used by sync to apply mappings)
-	if err := saveTagsDictionary(proposal); err != nil {
-		return fmt.Errorf("error saving tags dictionary: %w", err)
-	}
-
-	fmt.Printf("\n✓ Saved tags dictionary: %s\n", tagsDictionaryFile)
-	fmt.Printf("✅ Tag normalization approved! Mappings will be applied during sync to Obsidian.\n")
-	fmt.Printf("   Summaries remain unchanged - mappings are applied only when writing to Obsidian.\n")
-
-	return nil
-}
-
-func saveTagsProposal(dict *TagsDictionary) error {
-	data, err := json.MarshalIndent(dict, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal proposal: %w", err)
-	}
-
-	if err := os.WriteFile(tagsProposalFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write proposal file: %w", err)
-	}
-
-	return nil
-}
-
-func loadTagsProposal() (*TagsDictionary, error) {
-	data, err := os.ReadFile(tagsProposalFile)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read proposal file: %w (run normalize first to generate proposal)", err)
-	}
-
-	var dict TagsDictionary
-	if err := json.Unmarshal(data, &dict); err != nil {
-		return nil, fmt.Errorf("failed to parse proposal: %w", err)
-	}
-
-	return &dict, nil
-}
-
-func saveTagsDictionary(dict *TagsDictionary) error {
-	data, err := json.MarshalIndent(dict, "", "  ")
-	if err != nil {
-		return fmt.Errorf("failed to marshal dictionary: %w", err)
-	}
-
-	if err := os.WriteFile(tagsDictionaryFile, data, 0644); err != nil {
-		return fmt.Errorf("failed to write dictionary file: %w", err)
-	}
-
-	return nil
-}
-
-func loadTagsDictionary() (*TagsDictionary, error) {
-	data, err := os.ReadFile(tagsDictionaryFile)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil // No dictionary yet
-		}
-		return nil, fmt.Errorf("failed to read dictionary: %w", err)
-	}
-
-	var dict TagsDictionary
-	if err := json.Unmarshal(data, &dict); err != nil {
-		return nil, fmt.Errorf("failed to parse dictionary: %w", err)
-	}
-
-	return &dict, nil
-}
-
 // fuzzyPreProcess consolidates tags using fuzzy matching for obvious duplicates
 // Returns consolidated tag list and mappings (canonical -> [originals])
 func fuzzyPreProcess(tags []tagInfo) ([]tagInfo, map[string][]string) {
@@ -769,4 +540,86 @@ func isCommonSuffix(s string) bool {
 		}
 	}
 	return false
+}
+
+// NormalizeResult holds the result from the LLM normalization
+type NormalizeResult struct {
+	Mappings map[string][]string `json:"mappings"` // canonical tag -> list of old tags
+}
+
+// NormalizePremappings holds the fuzzy pre-processing mappings
+type NormalizePremappings struct {
+	Mappings map[string][]string `json:"mappings"` // canonical tag -> list of old tags
+}
+
+// loadNormalizeResult loads normalize-result.json (LLM output)
+func loadNormalizeResult() (*NormalizeResult, error) {
+	data, err := os.ReadFile("normalize-result.json")
+	if err != nil {
+		return nil, fmt.Errorf("failed to read normalize-result.json: %w", err)
+	}
+
+	// The file format is an array of {canonical_tag, old_tags}
+	var llmResult []struct {
+		CanonicalTag string   `json:"canonical_tag"`
+		OldTags      []string `json:"old_tags"`
+	}
+
+	if err := json.Unmarshal(data, &llmResult); err != nil {
+		return nil, fmt.Errorf("failed to parse normalize-result.json: %w", err)
+	}
+
+	// Convert to map format
+	mappings := make(map[string][]string)
+	for _, entry := range llmResult {
+		// Filter out the canonical tag itself from old_tags (only keep actual changes)
+		var oldTags []string
+		for _, oldTag := range entry.OldTags {
+			if oldTag != entry.CanonicalTag {
+				oldTags = append(oldTags, oldTag)
+			}
+		}
+		if len(oldTags) > 0 {
+			mappings[entry.CanonicalTag] = oldTags
+		}
+	}
+
+	return &NormalizeResult{Mappings: mappings}, nil
+}
+
+// loadNormalizePremappings loads normalize-premappings.json (fuzzy pre-processing)
+func loadNormalizePremappings() (*NormalizePremappings, error) {
+	data, err := os.ReadFile("normalize-premappings.json")
+	if err != nil {
+		if os.IsNotExist(err) {
+			return &NormalizePremappings{Mappings: make(map[string][]string)}, nil
+		}
+		return nil, fmt.Errorf("failed to read normalize-premappings.json: %w", err)
+	}
+
+	// The file format is an array of {canonical_tag, old_tags}
+	var preMappingsArray []struct {
+		CanonicalTag string   `json:"canonical_tag"`
+		OldTags      []string `json:"old_tags"`
+	}
+
+	if err := json.Unmarshal(data, &preMappingsArray); err != nil {
+		return nil, fmt.Errorf("failed to parse normalize-premappings.json: %w", err)
+	}
+
+	// Convert to map format
+	mappings := make(map[string][]string)
+	for _, entry := range preMappingsArray {
+		var oldTags []string
+		for _, oldTag := range entry.OldTags {
+			if oldTag != entry.CanonicalTag {
+				oldTags = append(oldTags, oldTag)
+			}
+		}
+		if len(oldTags) > 0 {
+			mappings[entry.CanonicalTag] = oldTags
+		}
+	}
+
+	return &NormalizePremappings{Mappings: mappings}, nil
 }
