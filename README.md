@@ -57,6 +57,7 @@ go build -o krisp-sync .
   - `download` - Download meetings from Krisp API to local cache
   - `summarize` - Generate AI summaries for cached meetings
   - `sync` - Sync cached meetings and summaries to Obsidian
+  - `check-updates` - Check Krisp API for updated meetings and sync changes to Obsidian
   - `extract-tags` - Extract all existing tags from Obsidian vault to obsidian-tags.json
   - `normalize-prompt` - Generate tag normalization prompt for initial mass import
   - `repair` - Sync filesystem state with tracking state
@@ -78,9 +79,10 @@ go build -o krisp-sync .
   - Can be run repeatedly for testing templates
   - Does not mark meetings as synced
 
-- `--meeting <meeting-id>` - Process a specific meeting by ID
-  - Combine with `--overwrite` to re-summarize and re-sync a single meeting
-  - Useful for fixing issues with individual meetings
+- `--meeting <meeting-id>` - Process specific meeting(s) by ID
+  - Supports comma-separated IDs: `--meeting id1,id2,id3`
+  - Combine with `--overwrite` to re-summarize and re-sync
+  - Useful for fixing issues with individual meetings or batches
 
 - `--apply-normalization` - Apply tag normalization during sync (for initial mass import only)
   - Loads `normalize-result.json` and `normalize-premappings.json`
@@ -93,6 +95,7 @@ go build -o krisp-sync .
   - Case-insensitive field matching
   - Example: `--update-fields time,date` updates only time and date fields
   - Only processes existing files (skips files that don't exist)
+
 
 ## How It Works
 
@@ -265,6 +268,42 @@ This preserves:
 
 **Use case**: If you've manually curated tags or fixed participant names, use `--update-fields` instead of `--overwrite` to avoid losing those edits.
 
+### Automatically sync changes from Krisp.ai
+
+If you've fixed participant names, updated meeting titles, or made other changes in Krisp.ai, you can automatically detect and sync those changes:
+
+```bash
+# Check for updates and automatically sync changed fields to Obsidian
+./krisp-sync --step check-updates
+```
+
+This will:
+1. Efficiently fetch all meetings from Krisp API in a single request
+2. Compare with local cache to detect changes (participants, title, duration)
+3. Show what changed for each meeting
+4. Update only the changed metadata in local cache (transcript data is preserved)
+5. Automatically sync only the changed fields to Obsidian (preserving your manual edits)
+
+**Example output:**
+```
+🔍 Checking for updated meetings on Krisp API...
+📊 Total meetings on Krisp: 1504
+📦 Cached meetings: 1504
+
+🔎 Comparing cached meetings with API...
+  Checked 100/1504 meetings...
+  🔄 0199eea7f41970609f799e8439462a3e has changes:
+     - participants: 'Matthew Newhook' → 'Matthew Newhook, Michael Whelan'
+
+✅ Found and updated 1 meeting(s) with changes
+
+📝 Syncing changes to Obsidian...
+  Updating fields [participants] for 1 meeting(s)...
+    ✓ Updated 0199eea7f41970609f799e8439462a3e
+
+✅ All changes synced to Obsidian!
+```
+
 ### Tag normalization for initial mass import (optional)
 
 If you've already imported many meetings before starting to use krisp-sync, you may want to consolidate similar tags for consistency. This is a **one-time workflow** for initial mass imports only. Daily incremental syncs automatically use your existing Obsidian tags.
@@ -374,7 +413,9 @@ The state is saved after each meeting is processed, so you can safely resume whe
 
 ### Rate limiting / API errors
 
-The tool includes 500ms delays between API calls. If you encounter rate limits, run smaller batches with `--limit`.
+If you encounter rate limits from the Krisp API, the tool will show an error. You can try running smaller batches with `--limit` or waiting before retrying.
+
+**Note**: The `--check-updates` feature is optimized to use a single API call to fetch meeting metadata for comparison. For large collections (1500+ meetings), it typically completes in under 30 seconds. Changed metadata is updated in-place in the cache - full meeting data (transcripts) is never re-downloaded.
 
 ### Want to update files without losing manual edits
 
@@ -396,7 +437,8 @@ This preserves any fields you haven't specified, including manual edits.
 - `download.go` - Stage 1: Download meetings
 - `summarize.go` - Stage 2: Generate summaries
 - `sync.go` - Stage 3: Sync to Obsidian
-- `normalize.go` - Stage 4: Tag normalization
+- `check-updates.go` - Check for updated meetings and auto-sync changes
+- `normalize.go` - Tag normalization workflow
 - `state.go` - Sync state management
 - `cache.go` - Local caching helpers
 - `utils.go` - Utility functions

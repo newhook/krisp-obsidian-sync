@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"text/template"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -160,6 +161,13 @@ func writeFrontmatterField(buf *bytes.Buffer, key string, value interface{}) {
 			buf.WriteString(fmt.Sprintf("%s: \"%s\"\n", key, v))
 		} else {
 			buf.WriteString(fmt.Sprintf("%s: %s\n", key, v))
+		}
+	case time.Time:
+		// Time field - format as YYYY-MM-DD for date fields
+		if key == "date" {
+			buf.WriteString(fmt.Sprintf("%s: %s\n", key, v.Format("2006-01-02")))
+		} else {
+			buf.WriteString(fmt.Sprintf("%s: %s\n", key, v.Format(time.RFC3339)))
 		}
 	default:
 		// Other types - convert to string representation

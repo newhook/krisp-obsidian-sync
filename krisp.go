@@ -28,11 +28,20 @@ type MeetingsListResponse struct {
 	} `json:"data"`
 }
 
+type Speaker struct {
+	ID        string `json:"id"`
+	Email     string `json:"email"`
+	FirstName string `json:"first_name"` // Optional
+	LastName  string `json:"last_name"`  // Optional
+	Photo     string `json:"photo"`      // Optional
+}
+
 type MeetingSummary struct {
 	ID        string    `json:"id"`
 	Title     string    `json:"name"` // API uses "name" not "title"
 	CreatedAt time.Time `json:"started_at"`
 	Duration  int       `json:"duration"`
+	Speakers  []Speaker `json:"speakers"` // Array format from /meetings/list
 }
 
 type Meeting struct {

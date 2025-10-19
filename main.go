@@ -30,7 +30,7 @@ var (
 func main() {
 	// Parse command-line flags
 	limitFlag := flag.Int("limit", 1, "Number of meetings to process (default: 1 for testing)")
-	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, normalize-prompt, extract-tags, repair, or all (default: all)")
+	stepFlag := flag.String("step", "all", "Step to run: download, summarize, sync, check-updates, normalize-prompt, extract-tags, repair, or all (default: all)")
 	overwriteFlag := flag.Bool("overwrite", false, "Force re-process meetings, ignoring state (re-summarize and re-sync)")
 	testFlag := flag.Bool("test", false, "Test mode: create a single test file without updating state (sync stage only)")
 	applyNormalizationFlag := flag.Bool("apply-normalization", false, "Apply tag normalization from normalize-result.json during sync (for initial mass import)")
@@ -115,8 +115,16 @@ func main() {
 
 	// Stage 1: Download
 	if runAll || step == "download" {
-		if err := runDownload(ctx, *limitFlag, syncState, cache); err != nil {
+		if err := runDownload(ctx, *limitFlag, syncState, *overwriteFlag, meetingIDs, cache); err != nil {
 			fmt.Printf("❌ Error in download stage: %v\n", err)
+			return
+		}
+	}
+
+	// Check for updates from Krisp API
+	if step == "check-updates" {
+		if err := runCheckUpdates(ctx, syncState, cache, obsidianVaultPath); err != nil {
+			fmt.Printf("❌ Error in check-updates stage: %v\n", err)
 			return
 		}
 	}
