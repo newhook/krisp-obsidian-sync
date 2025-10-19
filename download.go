@@ -3,12 +3,39 @@ package main
 import (
 	"context"
 	"fmt"
-	"time"
 )
 
 // Stage 1: Download meetings from Krisp API and cache them locally
-func runDownload(ctx context.Context, limit int, syncState *SyncState, cache *Cache) error {
+func runDownload(ctx context.Context, limit int, syncState *SyncState, overwrite bool, meetingIDs []string, cache *Cache) error {
 	fmt.Println("\n=== Stage 1: Downloading meetings ===")
+
+	// Handle specific meeting IDs mode
+	if len(meetingIDs) > 0 {
+		fmt.Printf("🎯 Re-downloading %d specific meeting(s) from Krisp API\n", len(meetingIDs))
+		for _, meetingID := range meetingIDs {
+			fullMeeting, err := fetchMeeting(ctx, meetingID)
+			if err != nil {
+				fmt.Printf("❌ Error fetching meeting %s: %v\n", meetingID, err)
+				continue
+			}
+
+			// Save to cache (overwriting existing)
+			if err := cache.SaveMeeting(fullMeeting); err != nil {
+				fmt.Printf("  ⚠ Error saving to cache: %v\n", err)
+				continue
+			}
+
+			syncState.SyncedMeetings[fullMeeting.ID] = true
+			fmt.Printf("  ✓ Re-downloaded and cached: %s\n", meetingID)
+
+			// Save state
+			if err := syncState.Save(); err != nil {
+				fmt.Printf("  ⚠ Warning: Could not save sync state: %v\n", err)
+			}
+		}
+		fmt.Printf("\n✅ Re-downloaded %d meeting(s)\n", len(meetingIDs))
+		return nil
+	}
 
 	// Fetch all meetings from API
 	allMeetings, err := fetchAllMeetings(ctx)
@@ -18,12 +45,16 @@ func runDownload(ctx context.Context, limit int, syncState *SyncState, cache *Ca
 
 	fmt.Printf("📊 Total meetings fetched from API: %d\n", len(allMeetings))
 
-	// Filter to only meetings not yet downloaded
+	// Filter to only meetings not yet downloaded (unless overwrite is set)
 	var toDownload []MeetingSummary
 	for _, m := range allMeetings {
-		if !cache.MeetingExists(m.ID) {
+		if overwrite || !cache.MeetingExists(m.ID) {
 			toDownload = append(toDownload, m)
 		}
+	}
+
+	if overwrite && len(toDownload) > 0 {
+		fmt.Printf("🔄 Overwrite mode: will re-download all %d meetings\n", len(toDownload))
 	}
 
 	if len(toDownload) == 0 {
@@ -68,9 +99,6 @@ func runDownload(ctx context.Context, limit int, syncState *SyncState, cache *Ca
 		if err := syncState.Save(); err != nil {
 			fmt.Printf("  ⚠ Warning: Could not save sync state: %v\n", err)
 		}
-
-		// Be nice to the API
-		time.Sleep(500 * time.Millisecond)
 	}
 
 	fmt.Printf("\n✅ Downloaded %d meeting(s)\n", len(toDownload))
