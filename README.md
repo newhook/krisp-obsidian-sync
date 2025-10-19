@@ -13,6 +13,8 @@ A tool to sync meeting recordings from Krisp.ai to your Obsidian vault with AI-g
 - **AI-powered summaries**: Uses Gemini to create structured summaries with topics, descriptions, and tags
 - **Tag normalization**: Consolidates similar tags across meetings for consistency
 - **Obsidian integration**: Creates daily notes with Dataview queries to automatically list meetings
+- **Automatic timezone conversion**: Converts meeting times from UTC to your local timezone
+- **Selective field updates**: Update only specific frontmatter fields without losing manual edits
 - **Graceful interruption**: Supports Ctrl+C cancellation with state preservation
 - **Resumable**: State tracking allows you to resume interrupted operations
 
@@ -85,6 +87,13 @@ go build -o krisp-sync .
   - Applies tag mappings when writing to Obsidian
   - Use only during initial mass import, not for daily incremental syncs
 
+- `--update-fields <field1,field2,...>` - Update only specific frontmatter fields in existing Obsidian files
+  - Reads existing files and preserves all fields except those specified
+  - Useful for fixing issues without losing manual edits (tags, participants, etc.)
+  - Case-insensitive field matching
+  - Example: `--update-fields time,date` updates only time and date fields
+  - Only processes existing files (skips files that don't exist)
+
 ## How It Works
 
 ### Stage 1: Download
@@ -120,7 +129,7 @@ Generates AI summaries using Google Gemini for each cached meeting.
 
 ### Stage 3: Sync
 
-Syncs meetings and summaries to your Obsidian vault.
+Syncs meetings and summaries to your Obsidian vault. All timestamps are automatically converted from UTC to your local timezone.
 
 ```bash
 ./krisp-sync --step sync --limit 10
@@ -230,6 +239,32 @@ This workflow:
 ./krisp-sync --step sync --test
 ```
 
+### Update specific fields in existing meetings
+
+If you need to update only certain frontmatter fields without losing your manual edits (e.g., after fixing a timezone bug or updating templates):
+
+```bash
+# Update only time and date fields in all meetings
+./krisp-sync --step sync --limit 0 --update-fields time,date
+
+# Update only description field
+./krisp-sync --step sync --limit 0 --update-fields description
+
+# Update specific meetings
+./krisp-sync --step sync --meeting id1,id2,id3 --update-fields time,date
+
+# Update multiple fields
+./krisp-sync --step sync --limit 0 --update-fields time,date,description
+```
+
+This preserves:
+- All manually added or modified tags
+- Custom participant names
+- Any other frontmatter fields not specified
+- The entire body content of the note
+
+**Use case**: If you've manually curated tags or fixed participant names, use `--update-fields` instead of `--overwrite` to avoid losing those edits.
+
 ### Tag normalization for initial mass import (optional)
 
 If you've already imported many meetings before starting to use krisp-sync, you may want to consolidate similar tags for consistency. This is a **one-time workflow** for initial mass imports only. Daily incremental syncs automatically use your existing Obsidian tags.
@@ -317,10 +352,21 @@ Run the download stage first:
 
 ### "All meetings already synced"
 
-Either all meetings are up to date, or use `--resync` to force re-sync:
+Either all meetings are up to date, or use `--overwrite` to force re-sync:
 ```bash
-./krisp-sync --step sync --resync
+./krisp-sync --step sync --overwrite
 ```
+
+### Meeting times are incorrect (timezone issue)
+
+All meeting times are automatically converted from UTC to your local timezone. If you have existing meetings with incorrect times:
+
+```bash
+# Update only time and date fields, preserving all manual edits
+./krisp-sync --step sync --limit 0 --update-fields time,date
+```
+
+This will fix the timestamps without losing any manually added tags or other edits.
 
 ### Ctrl+C during operation
 
@@ -329,6 +375,17 @@ The state is saved after each meeting is processed, so you can safely resume whe
 ### Rate limiting / API errors
 
 The tool includes 500ms delays between API calls. If you encounter rate limits, run smaller batches with `--limit`.
+
+### Want to update files without losing manual edits
+
+Use `--update-fields` instead of `--overwrite`:
+
+```bash
+# Update only specific fields
+./krisp-sync --step sync --update-fields description,tags --limit 0
+```
+
+This preserves any fields you haven't specified, including manual edits.
 
 ## Development
 
