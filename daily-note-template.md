@@ -4,7 +4,8 @@
 
 ```dataview
 TABLE WITHOUT ID
-  link(file.path, description) as "Meeting",
+  link(file.path, title) as "Meeting",
+  description as "Description",
   time as "Time",
   participants as "Participants"
 FROM "{{.YearPath}}/{{.MonthPath}}/meetings"

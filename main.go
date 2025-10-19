@@ -35,6 +35,7 @@ func main() {
 	testFlag := flag.Bool("test", false, "Test mode: create a single test file without updating state (sync stage only)")
 	applyNormalizationFlag := flag.Bool("apply-normalization", false, "Apply tag normalization from normalize-result.json during sync (for initial mass import)")
 	meetingIDFlag := flag.String("meeting", "", "Process specific meeting IDs (comma-separated, combine with --overwrite to re-process)")
+	updateFieldsFlag := flag.String("update-fields", "", "Update only specific frontmatter fields in existing Obsidian files (comma-separated, e.g., 'date,time')")
 	flag.Parse()
 
 	// Parse meeting IDs if provided
@@ -43,6 +44,15 @@ func main() {
 		meetingIDs = strings.Split(*meetingIDFlag, ",")
 		for i := range meetingIDs {
 			meetingIDs[i] = strings.TrimSpace(meetingIDs[i])
+		}
+	}
+
+	// Parse update fields if provided
+	var updateFields []string
+	if *updateFieldsFlag != "" {
+		updateFields = strings.Split(*updateFieldsFlag, ",")
+		for i := range updateFields {
+			updateFields[i] = strings.TrimSpace(updateFields[i])
 		}
 	}
 
@@ -121,7 +131,7 @@ func main() {
 
 	// Stage 3: Sync
 	if runAll || step == "sync" {
-		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *overwriteFlag, *testFlag, *applyNormalizationFlag, meetingIDs, cache); err != nil {
+		if err := runSync(ctx, obsidianVaultPath, *limitFlag, syncState, *overwriteFlag, *testFlag, *applyNormalizationFlag, meetingIDs, updateFields, cache); err != nil {
 			fmt.Printf("❌ Error in sync stage: %v\n", err)
 			return
 		}

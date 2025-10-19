@@ -178,7 +178,8 @@ func setHeaders(req *http.Request) {
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("krisp_header_app", "web")
 	req.Header.Set("krisp_header_web_project", "note")
-	req.Header.Set("krisp_origin_timezone", "-04:00")
+	// Dynamically set timezone based on system's local timezone
+	req.Header.Set("krisp_origin_timezone", time.Now().Format("-07:00"))
 	req.Header.Set("Origin", "https://app.krisp.ai")
 	req.Header.Set("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)")
 }
